@@ -18,7 +18,6 @@ on:
 
 env:
   PROJECT_NAME: nexus_client
-  BUILD_DATE: ${{ steps.set_date.outputs.build_date }}
 
 jobs:
   prepare:
@@ -102,10 +101,6 @@ jobs:
             os: macos-latest
             bin_suffix: macos-arm
     
-    env:
-      BIN_NAME: ${{ env.PROJECT_NAME }}-${{ matrix.bin_suffix }}
-      RUST_TARGET: ${{ matrix.rust_target }}
-    
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -131,28 +126,28 @@ jobs:
           # 根据平台优化和移动文件
           if [ "${{ runner.os }}" == "Windows" ]; then
             # Windows 特殊处理
-            Move-Item "target/$env:RUST_TARGET/release/$env:PROJECT_NAME.exe" $env:BIN_NAME
+            Move-Item "target/$env:RUST_TARGET/release/$env:PROJECT_NAME.exe" "$env:PROJECT_NAME-${{ matrix.bin_suffix }}"
             if (Get-Command llvm-strip -ErrorAction SilentlyContinue) {
-                llvm-strip $env:BIN_NAME
+                llvm-strip "$env:PROJECT_NAME-${{ matrix.bin_suffix }}"
             }
             elseif (Get-Command strip -ErrorAction SilentlyContinue) {
-                strip $env:BIN_NAME
+                strip "$env:PROJECT_NAME-${{ matrix.bin_suffix }}"
             }
-            $hash = Get-FileHash $env:BIN_NAME -Algorithm SHA256
-            $hash.Hash.ToLower() | Out-File "$env:BIN_NAME.sha256"
+            $hash = Get-FileHash "$env:PROJECT_NAME-${{ matrix.bin_suffix }}" -Algorithm SHA256
+            $hash.Hash.ToLower() | Out-File "$env:PROJECT_NAME-${{ matrix.bin_suffix }}.sha256"
           else
             # Linux/macOS 处理
-            mv "target/${{ matrix.rust_target }}/release/${{ env.PROJECT_NAME }}" "${{ env.BIN_NAME }}"
+            mv "target/${{ matrix.rust_target }}/release/${{ env.PROJECT_NAME }}" "${{ env.PROJECT_NAME }}-${{ matrix.bin_suffix }}"
             
             # 优化文件大小
             if command -v llvm-strip >/dev/null 2>&1; then
-              llvm-strip "${{ env.BIN_NAME }}"
+              llvm-strip "${{ env.PROJECT_NAME }}-${{ matrix.bin_suffix }}"
             elif command -v strip >/dev/null 2>&1; then
-              strip "${{ env.BIN_NAME }}"
+              strip "${{ env.PROJECT_NAME }}-${{ matrix.bin_suffix }}"
             fi
             
             # 生成校验和
-            sha256sum "${{ env.BIN_NAME }}" > "${{ env.BIN_NAME }}.sha256"
+            sha256sum "${{ env.PROJECT_NAME }}-${{ matrix.bin_suffix }}" > "${{ env.PROJECT_NAME }}-${{ matrix.bin_suffix }}.sha256"
           fi
         
       - uses: actions/upload-artifact@v4
