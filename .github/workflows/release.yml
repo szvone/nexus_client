@@ -207,7 +207,7 @@ jobs:
     needs: [prepare, build]
     runs-on: ubuntu-latest
     permissions:
-      contents: write  # 关键修复：添加写入权限
+      contents: write
     
     steps:
       - name: Download all artifacts
@@ -217,10 +217,31 @@ jobs:
           pattern: '*-binary'
           merge-multiple: true
           
+      - name: Verify downloaded artifacts
+        run: |
+          echo "Artifacts directory structure:"
+          find artifacts -type f -print
+          echo ""
+          echo "Total files: $(find artifacts -type f | wc -l)"
+        shell: bash
+          
+      - name: Prepare release assets
+        run: |
+          # 创建统一的发布目录
+          mkdir -p release_assets
+          
+          # 复制所有文件到统一目录
+          find artifacts -type f -exec cp {} release_assets \;
+          
+          # 列出所有文件
+          echo "Release assets:"
+          ls -lh release_assets
+        shell: bash
+        
       - name: Create release
         uses: softprops/action-gh-release@v1
         with:
-          token: ${{ secrets.GITHUB_TOKEN }}  # 显式传递 token
+          token: ${{ secrets.GITHUB_TOKEN }}
           tag_name: ${{ needs.prepare.outputs.version_tag }}
           name: "Nexus Client ${{ needs.prepare.outputs.version_number }}"
           body: |
@@ -234,22 +255,12 @@ jobs:
             
             | Platform        | File                              |
             |-----------------|-----------------------------------|
-            | Linux (glibc)   | `nexus_client-linux`              |
-            | Linux (static)  | `nexus_client-linux-static`       |
+            | Linux           | `nexus_client-linux`              |
+            | Linux(备用)     | `nexus_client-linux-static`       |
             | Windows         | `nexus_client-windows.exe`        |
-            | macOS Intel     | `nexus_client-macos-intel`        |
-            | macOS ARM       | `nexus_client-macos-arm`          |
+            | macOS(Intel芯片) | `nexus_client-macos-intel`        |
+            | macOS(M芯片)    | `nexus_client-macos-arm`          |
             
           draft: false
           prerelease: false
-          files: |
-            artifacts/linux-gnu-binary/nexus_client-linux
-            artifacts/linux-gnu-binary/nexus_client-linux.sha256
-            artifacts/linux-musl-binary/nexus_client-linux-static
-            artifacts/linux-musl-binary/nexus_client-linux-static.sha256
-            artifacts/windows-binary/nexus_client-windows.exe
-            artifacts/windows-binary/nexus_client-windows.exe.sha256
-            artifacts/macos-intel-binary/nexus_client-macos-intel
-            artifacts/macos-intel-binary/nexus_client-macos-intel.sha256
-            artifacts/macos-arm-binary/nexus_client-macos-arm
-            artifacts/macos-arm-binary/nexus_client-macos-arm.sha256
+          files: release_assets/*
