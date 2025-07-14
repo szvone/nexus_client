@@ -1,39 +1,51 @@
-name: Rust Nightly Release
+name: Nexus Client Release
 
 on:
   push:
     tags:
-      - 'v[0-9]+.[0-9]+.[0-9]+'
-      - 'v[0-9]+.[0-9]+'
-  workflow_dispatch:
+      - 'v[0-9]+.[0-9]+.[0-9]+'  # 推送版本标签时触发
+  workflow_dispatch:  # 支持手动触发
     inputs:
       version:
-        description: '手动指定版本号 (例如 1.0.0)'
+        description: '版本号 (例如 1.0.0)'
         required: true
         default: '1.0.0'
-        
+      skip_tags:
+        description: '跳过标签创建？'
+        type: boolean
+        required: false
+        default: false
+
 env:
-  PROJECT_NAME: myapp
+  PROJECT_NAME: nexus_client
+  BUILD_DATE: ${{ steps.set_date.outputs.build_date }}
 
 jobs:
-  build_prep:
-    name: Prepare Build
+  prepare:
+    name: Prepare Release
     runs-on: ubuntu-latest
     outputs:
-      version_tag: ${{ steps.extract_version.outputs.version }}
+      version_tag: ${{ steps.set_version.outputs.version_tag }}
       build_date: ${{ steps.set_date.outputs.build_date }}
+      version_number: ${{ steps.set_version.outputs.version_number }}
     steps:
-      - name: Checkout repository
+      - name: Checkout code
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-          
-      - name: Extract version from tag
-        id: extract_version
+        if: ${{ !inputs.skip_tags }}
+        
+      - name: Set version
+        id: set_version
         run: |
-          TAG_NAME="${{ github.ref_name }}"
-          VERSION=${TAG_NAME#v}
-          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          if [ -n "${{ github.event.inputs.version }}" ]; then
+            VERSION="${{ github.event.inputs.version }}"
+          elif [ -n "${{ github.ref_name }}" ]; then
+            VERSION="${GITHUB_REF_NAME#v}"
+          else
+            VERSION="${{ inputs.version }}"
+          fi
+          
+          echo "version_tag=v$VERSION" >> $GITHUB_OUTPUT
+          echo "version_number=$VERSION" >> $GITHUB_OUTPUT
           
       - name: Set build date
         id: set_date
@@ -41,35 +53,31 @@ jobs:
           BUILD_DATE=$(date -u +'%Y-%m-%dT%H:%M:%SZ')
           echo "build_date=$BUILD_DATE" >> $GITHUB_OUTPUT
           
-      - name: Prepare build info
+      - name: Create tag (if manual)
+        if: ${{ github.event_name == 'workflow_dispatch' && !inputs.skip_tags }}
         run: |
-          echo "Project: ${{ env.PROJECT_NAME }}" > build-info.txt
-          echo "Version: ${{ steps.extract_version.outputs.version }}" >> build-info.txt
-          echo "Build date: ${{ steps.set_date.outputs.build_date }}" >> build-info.txt
-          echo "Git commit: ${{ github.sha }}" >> build-info.txt
-          echo "Triggered by: ${{ github.actor }}" >> build-info.txt
-          
-      # 使用更新后的 artifact 上传方法
-      - name: Upload build info
-        uses: actions/upload-artifact@v4
-        with:
-          name: build-info
-          path: build-info.txt
+          git config user.name "GitHub Actions"
+          git config user.email "actions@github.com"
+          git tag ${{ steps.set_version.outputs.version_tag }} ${{ github.sha }}
+          git push origin ${{ steps.set_version.outputs.version_tag }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
   build:
     name: Build for ${{ matrix.target }}
+    needs: prepare
     runs-on: ${{ matrix.os }}
-    needs: build_prep
     strategy:
       fail-fast: false
       matrix:
         include:
-          # Linux 目标
+          # Linux 目标 (动态链接)
           - target: linux-gnu
             rust_target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
             bin_suffix: linux
-          
+            
+          # Linux 目标 (静态链接)
           - target: linux-musl
             rust_target: x86_64-unknown-linux-musl
             os: ubuntu-latest
@@ -81,30 +89,29 @@ jobs:
             rust_target: x86_64-pc-windows-msvc
             os: windows-latest
             bin_suffix: windows.exe
-          
-          # macOS 目标
+            
+          # macOS Intel 目标
           - target: macos-intel
             rust_target: x86_64-apple-darwin
             os: macos-latest
             bin_suffix: macos-intel
             
+          # macOS ARM 目标
           - target: macos-arm
             rust_target: aarch64-apple-darwin
             os: macos-latest
             bin_suffix: macos-arm
     
+    env:
+      BIN_NAME: ${{ env.PROJECT_NAME }}-${{ matrix.bin_suffix }}
+      RUST_TARGET: ${{ matrix.rust_target }}
+    
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
         
-      - name: Download build info
-        uses: actions/download-artifact@v4
-        with:
-          name: build-info
-          path: build-info
-          
       - name: Install system dependencies
-        if: matrix.extra_packages
+        if: ${{ matrix.extra_packages }}
         run: |
           if [[ "${{ runner.os }}" == "Linux" && "${{ matrix.extra_packages }}" ]]; then
             sudo apt-get update
@@ -121,30 +128,31 @@ jobs:
         run: |
           cargo build --release --target ${{ matrix.rust_target }}
           
-          # 减小文件大小
-          if command -v llvm-strip &> /dev/null; then
-            llvm-strip target/${{ matrix.rust_target }}/release/${{ env.PROJECT_NAME }}*
-          elif which strip > /dev/null; then
-            strip target/${{ matrix.rust_target }}/release/${{ env.PROJECT_NAME }}
-          fi
-          
-      - name: Prepare artifact
-        run: |
-          # 修复 Windows 文件名问题
-          BIN_PATH="target/${{ matrix.rust_target }}/release/${{ env.PROJECT_NAME }}"
-          OUTPUT_NAME="${{ env.PROJECT_NAME }}-${{ matrix.bin_suffix }}"
-          
+          # 根据平台优化和移动文件
           if [ "${{ runner.os }}" == "Windows" ]; then
-            mv "$BIN_PATH.exe" "$OUTPUT_NAME"
+            # Windows 特殊处理
+            Move-Item "target/$env:RUST_TARGET/release/$env:PROJECT_NAME.exe" $env:BIN_NAME
+            if (Get-Command llvm-strip -ErrorAction SilentlyContinue) {
+                llvm-strip $env:BIN_NAME
+            }
+            elseif (Get-Command strip -ErrorAction SilentlyContinue) {
+                strip $env:BIN_NAME
+            }
+            $hash = Get-FileHash $env:BIN_NAME -Algorithm SHA256
+            $hash.Hash.ToLower() | Out-File "$env:BIN_NAME.sha256"
           else
-            mv "$BIN_PATH" "$OUTPUT_NAME"
-          fi
-          
-          # 生成校验和
-          if [ "${{ runner.os }}" == "Windows" ]; then
-            certutil -hashfile "$OUTPUT_NAME" SHA256 | findstr -v ":" > "$OUTPUT_NAME.sha256"
-          else
-            sha256sum "$OUTPUT_NAME" > "$OUTPUT_NAME.sha256"
+            # Linux/macOS 处理
+            mv "target/${{ matrix.rust_target }}/release/${{ env.PROJECT_NAME }}" "${{ env.BIN_NAME }}"
+            
+            # 优化文件大小
+            if command -v llvm-strip >/dev/null 2>&1; then
+              llvm-strip "${{ env.BIN_NAME }}"
+            elif command -v strip >/dev/null 2>&1; then
+              strip "${{ env.BIN_NAME }}"
+            fi
+            
+            # 生成校验和
+            sha256sum "${{ env.BIN_NAME }}" > "${{ env.BIN_NAME }}.sha256"
           fi
         
       - uses: actions/upload-artifact@v4
@@ -156,16 +164,10 @@ jobs:
 
   create_release:
     name: Create GitHub Release
+    needs: [prepare, build]
     runs-on: ubuntu-latest
-    needs: build
     steps:
-      - name: Download build info
-        uses: actions/download-artifact@v4
-        with:
-          name: build-info
-          path: build-info
-          
-      - name: Download all binaries
+      - name: Download all artifacts
         uses: actions/download-artifact@v4
         with:
           path: artifacts
@@ -175,31 +177,35 @@ jobs:
       - name: Create release
         uses: softprops/action-gh-release@v1
         with:
-          tag_name: ${{ github.ref }}
-          name: "Release ${{ needs.build_prep.outputs.version_tag }}"
+          tag_name: ${{ needs.prepare.outputs.version_tag }}
+          name: "Nexus Client ${{ needs.prepare.outputs.version_number }}"
           body: |
-            # ${{ env.PROJECT_NAME }} ${{ needs.build_prep.outputs.version_tag }}
+            # Nexus Client ${{ needs.prepare.outputs.version_number }}
             
-            Build date: ${{ needs.build_prep.outputs.build_date }}
+            - Release date: ${{ needs.prepare.outputs.build_date }}
+            - Build commit: ${{ github.sha }}
+            - Built with Rust nightly
             
             ## Download Assets
+            
             | Platform        | File                              |
             |-----------------|-----------------------------------|
-            | Linux (glibc)   | `${{ env.PROJECT_NAME }}-linux`       |
-            | Linux (static)  | `${{ env.PROJECT_NAME }}-linux-static`|
-            | Windows         | `${{ env.PROJECT_NAME }}-windows.exe` |
-            | macOS Intel     | `${{ env.PROJECT_NAME }}-macos-intel` |
-            | macOS ARM       | `${{ env.PROJECT_NAME }}-macos-arm`   |
+            | Linux (glibc)   | `nexus_client-linux`              |
+            | Linux (static)  | `nexus_client-linux-static`       |
+            | Windows         | `nexus_client-windows.exe`        |
+            | macOS Intel     | `nexus_client-macos-intel`        |
+            | macOS ARM       | `nexus_client-macos-arm`          |
+            
           draft: false
           prerelease: false
           files: |
-            artifacts/linux-gnu-binary/${{ env.PROJECT_NAME }}-linux
-            artifacts/linux-gnu-binary/${{ env.PROJECT_NAME }}-linux.sha256
-            artifacts/linux-musl-binary/${{ env.PROJECT_NAME }}-linux-static
-            artifacts/linux-musl-binary/${{ env.PROJECT_NAME }}-linux-static.sha256
-            artifacts/windows-binary/${{ env.PROJECT_NAME }}-windows.exe
-            artifacts/windows-binary/${{ env.PROJECT_NAME }}-windows.exe.sha256
-            artifacts/macos-intel-binary/${{ env.PROJECT_NAME }}-macos-intel
-            artifacts/macos-intel-binary/${{ env.PROJECT_NAME }}-macos-intel.sha256
-            artifacts/macos-arm-binary/${{ env.PROJECT_NAME }}-macos-arm
-            artifacts/macos-arm-binary/${{ env.PROJECT_NAME }}-macos-arm.sha256
+            artifacts/linux-gnu-binary/nexus_client-linux
+            artifacts/linux-gnu-binary/nexus_client-linux.sha256
+            artifacts/linux-musl-binary/nexus_client-linux-static
+            artifacts/linux-musl-binary/nexus_client-linux-static.sha256
+            artifacts/windows-binary/nexus_client-windows.exe
+            artifacts/windows-binary/nexus_client-windows.exe.sha256
+            artifacts/macos-intel-binary/nexus_client-macos-intel
+            artifacts/macos-intel-binary/nexus_client-macos-intel.sha256
+            artifacts/macos-arm-binary/nexus_client-macos-arm
+            artifacts/macos-arm-binary/nexus_client-macos-arm.sha256
