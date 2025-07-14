@@ -117,11 +117,10 @@ jobs:
           toolchain: nightly
           targets: ${{ matrix.rust_target }}
           
-      - name: Build release (Linux/macOS)
-        if: runner.os != 'Windows'
+      - name: Build release (Linux)
+        if: runner.os == 'Linux'
         shell: bash
         run: |
-          # 修复的 Bash 脚本 - 移除了花括号语法问题
           cargo build --release --target ${{ matrix.rust_target }}
           
           # 移动文件
@@ -134,8 +133,27 @@ jobs:
             strip "${{ env.PROJECT_NAME }}-${{ matrix.bin_suffix }}"
           fi
           
-          # 生成校验和
+          # 生成校验和 (Linux)
           sha256sum "${{ env.PROJECT_NAME }}-${{ matrix.bin_suffix }}" > "${{ env.PROJECT_NAME }}-${{ matrix.bin_suffix }}.sha256"
+          
+      - name: Build release (macOS)
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          cargo build --release --target ${{ matrix.rust_target }}
+          
+          # 移动文件
+          mv "target/${{ matrix.rust_target }}/release/${{ env.PROJECT_NAME }}" "${{ env.PROJECT_NAME }}-${{ matrix.bin_suffix }}"
+          
+          # 优化文件大小
+          if command -v llvm-strip > /dev/null 2>&1; then
+            llvm-strip "${{ env.PROJECT_NAME }}-${{ matrix.bin_suffix }}"
+          elif command -v strip > /dev/null 2>&1; then
+            strip "${{ env.PROJECT_NAME }}-${{ matrix.bin_suffix }}"
+          fi
+          
+          # 生成校验和 (macOS)
+          shasum -a 256 "${{ env.PROJECT_NAME }}-${{ matrix.bin_suffix }}" > "${{ env.PROJECT_NAME }}-${{ matrix.bin_suffix }}.sha256"
           
       - name: Build release (Windows)
         if: runner.os == 'Windows'
