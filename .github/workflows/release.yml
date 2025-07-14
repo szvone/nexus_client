@@ -24,7 +24,7 @@ jobs:
     name: Prepare Release
     runs-on: ubuntu-latest
     permissions:
-      contents: write  # 关键修复：添加写入权限
+      contents: write
     outputs:
       version_tag: ${{ steps.set_version.outputs.version_tag }}
       build_date: ${{ steps.set_date.outputs.build_date }}
@@ -33,8 +33,8 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0  # 获取完整历史记录
-          token: ${{ secrets.GITHUB_TOKEN }}  # 使用 token 进行 checkout
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
         if: ${{ !inputs.skip_tags }}
         
       - name: Set version
@@ -63,14 +63,12 @@ jobs:
           git config user.name "GitHub Actions"
           git config user.email "actions@github.com"
           
-          # 使用 token 进行认证
+          # 使用 token 设置远程 URL
           git remote set-url origin https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git
           
           # 创建并推送标签
           git tag ${{ steps.set_version.outputs.version_tag }} ${{ github.sha }}
           git push origin ${{ steps.set_version.outputs.version_tag }}
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
   build:
     name: Build for ${{ matrix.target }}
@@ -114,6 +112,8 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
         
       - name: Install system dependencies
         if: ${{ matrix.extra_packages && runner.os == 'Linux' }}
@@ -143,9 +143,6 @@ jobs:
             strip "${{ env.PROJECT_NAME }}-${{ matrix.bin_suffix }}"
           fi
           
-          # 生成校验和 (Linux)
-          sha256sum "${{ env.PROJECT_NAME }}-${{ matrix.bin_suffix }}" > "${{ env.PROJECT_NAME }}-${{ matrix.bin_suffix }}.sha256"
-          
       - name: Build release (macOS)
         if: runner.os == 'macOS'
         shell: bash
@@ -161,9 +158,6 @@ jobs:
           elif command -v strip > /dev/null 2>&1; then
             strip "${{ env.PROJECT_NAME }}-${{ matrix.bin_suffix }}"
           fi
-          
-          # 生成校验和 (macOS)
-          shasum -a 256 "${{ env.PROJECT_NAME }}-${{ matrix.bin_suffix }}" > "${{ env.PROJECT_NAME }}-${{ matrix.bin_suffix }}.sha256"
           
       - name: Build release (Windows)
         if: runner.os == 'Windows'
@@ -197,18 +191,11 @@ jobs:
           else {
               Write-Host "No strip tools available, skipping size reduction"
           }
-          
-          # 生成 SHA256 校验和
-          $hash = Get-FileHash $outputName -Algorithm SHA256
-          $hash.Hash.ToLower() | Out-File "$outputName.sha256"
-          Write-Host "Generated SHA256 checksum: $($hash.Hash.ToLower())"
         
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.target }}-binary
-          path: |
-            ${{ env.PROJECT_NAME }}-${{ matrix.bin_suffix }}
-            ${{ env.PROJECT_NAME }}-${{ matrix.bin_suffix }}.sha256
+          path: ${{ env.PROJECT_NAME }}-${{ matrix.bin_suffix }}
 
   create_release:
     name: Create GitHub Release
@@ -263,11 +250,11 @@ jobs:
             
             | Platform        | File                              |
             |-----------------|-----------------------------------|
-            | Linux           | `nexus_client-linux`              |
-            | Linux(备用)     | `nexus_client-linux-static`       |
+            | Linux    | `nexus_client-linux`              |
+            | Linux (备用)  | `nexus_client-linux-static`       |
             | Windows         | `nexus_client-windows.exe`        |
-            | macOS(Intel芯片) | `nexus_client-macos-intel`        |
-            | macOS(M芯片)    | `nexus_client-macos-arm`          |
+            | macOS Intel芯片     | `nexus_client-macos-intel`        |
+            | macOS M芯片       | `nexus_client-macos-arm`          |
             
           draft: false
           prerelease: false
