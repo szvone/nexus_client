@@ -30,6 +30,8 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # 获取完整历史记录
         if: ${{ !inputs.skip_tags }}
         
       - name: Set version
@@ -204,6 +206,9 @@ jobs:
     name: Create GitHub Release
     needs: [prepare, build]
     runs-on: ubuntu-latest
+    permissions:
+      contents: write  # 关键修复：添加写入权限
+    
     steps:
       - name: Download all artifacts
         uses: actions/download-artifact@v4
@@ -215,6 +220,7 @@ jobs:
       - name: Create release
         uses: softprops/action-gh-release@v1
         with:
+          token: ${{ secrets.GITHUB_TOKEN }}  # 显式传递 token
           tag_name: ${{ needs.prepare.outputs.version_tag }}
           name: "Nexus Client ${{ needs.prepare.outputs.version_number }}"
           body: |
