@@ -51,11 +51,28 @@ struct Config {
 async fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
-    let mut file = File::open("./nexus_client.txt").unwrap();
-    let mut contents = String::new();
-    file.read_to_string(&mut contents).unwrap();
 
-    let config: Config = serde_yaml::from_str(&contents).unwrap();
+    // 文件读取处理
+    let contents = match std::fs::read_to_string("./nexus_client.txt") {
+        Ok(c) => c,
+        Err(e) => {
+            log::error!("配置文件读取失败: {}", e);
+            log::warn!("请检查文件路径或权限设置");
+            wait_for_enter();
+            return;
+        }
+    };
+
+    // YAML解析处理
+    let config: Config = match serde_yaml::from_str(&contents) {
+        Ok(c) => c,
+        Err(e) => {
+            log::error!("YAML解析失败: {}", e);
+            log::warn!("请检查配置文件格式是否正确");
+            wait_for_enter();
+            return;
+        }
+    };
 
     // 使用配置
     log::info!("服务端地址: {}", config.host);
@@ -96,7 +113,7 @@ async fn main() {
                 // Send result to API2
                 if let Err(e) = http_client.post(submit_url.clone()).json(&response).send().await {
                     // eprintln!("Failed to send results to API2: {}", e);
-                    log::info!("与任务分发服务器通讯失败 {:?}", e);
+                    log::info!("与任务分发服务器通讯失败，请检查配置文件的端口和IP是否正确！ {:?}", e);
                 }
             }
             Ok(None) => {
@@ -104,7 +121,7 @@ async fn main() {
                 sleep(Duration::from_secs(5)).await;
             }
             Err(e) => {
-                log::info!("与任务分发服务器通讯失败 {:?}", e);
+                log::info!("与任务分发服务器通讯失败，请检查配置文件的端口和IP是否正确！ {:?}", e);
 
                 // log::info!("与任务分发服务器通讯失败，等待10秒...");
                 // eprintln!("Error fetching task: {}. Retrying...", e);
@@ -112,6 +129,18 @@ async fn main() {
             }
         }
     }
+}
+
+// 等待用户按回车键的函数
+fn wait_for_enter() {
+    use std::io::{self, Write};
+    
+    let mut input = String::new();
+    print!("\n发生错误，按回车键退出...");
+    io::stdout().flush().expect("刷新输出失败");
+    io::stdin()
+        .read_line(&mut input)
+        .expect("读取输入失败");
 }
 
 async fn fetch_task(client: &Client, url: String) -> Result<Option<TaskRequest>, ReqwestError> {
