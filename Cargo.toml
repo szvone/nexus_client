@@ -1,7 +1,12 @@
 [package]
 name = "nexus_client"
-version = "0.1.0"
+version = "1.0.0"
 edition = "2024"
+
+[[bin]]
+name = "nexus_client" # 二进制输出名称
+path = "src/main.rs"
+
 
 [dependencies]
 nexus-sdk = { git = "https://github.com/nexus-xyz/nexus-zkvm", tag = "0.3.4" }

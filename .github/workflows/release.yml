@@ -1,0 +1,217 @@
+name: Nightly Release Build
+
+on:
+  push:
+    tags:
+      - 'v*' # 触发条件：推送到v开头的tag时
+
+env:
+  PROJECT_NAME: myapp
+  BUILD_DATE: ${{ github.event.head_commit.timestamp }}
+
+jobs:
+  create-release:
+    name: Create Release
+    runs-on: ubuntu-latest
+    outputs:
+      release_id: ${{ steps.create_release.outputs.id }}
+      upload_url: ${{ steps.create_release.outputs.upload_url }}
+
+    steps:
+      - name: Create Release
+        id: create_release
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: "${{ env.PROJECT_NAME }} ${{ github.ref_name }}"
+          body: |
+            Built with Rust nightly
+            Build date: ${{ env.BUILD_DATE }}
+          draft: false
+          prerelease: false
+
+  build:
+    name: Build for ${{ matrix.target }} (${{ matrix.rust_target }})
+    runs-on: ${{ matrix.os }}
+    needs: create-release
+    strategy:
+      matrix:
+        include:
+          # Linux 目标 (动态链接)
+          - target: linux-gnu
+            rust_target: x86_64-unknown-linux-gnu
+            os: ubuntu-22.04
+            bin_name: ${{ env.PROJECT_NAME }}-linux-x64
+            artifact_name: linux-gnu
+
+          # Linux 目标 (静态链接)
+          - target: linux-musl
+            rust_target: x86_64-unknown-linux-musl
+            os: ubuntu-22.04
+            bin_name: ${{ env.PROJECT_NAME }}-linux-static
+            artifact_name: linux-musl
+            extra_packages: musl-tools
+
+          # Windows 目标
+          - target: win-msvc
+            rust_target: x86_64-pc-windows-msvc
+            os: windows-latest
+            bin_name: ${{ env.PROJECT_NAME }}-windows.exe
+            artifact_name: windows
+            extra_actions: |
+              choco install -y llvm # 为链接器提供支持
+
+          # macOS Intel 目标
+          - target: macos-intel
+            rust_target: x86_64-apple-darwin
+            os: macos-12
+            bin_name: ${{ env.PROJECT_NAME }}-macos-intel
+            artifact_name: macos-intel
+
+          # macOS ARM 目标
+          - target: macos-arm
+            rust_target: aarch64-apple-darwin
+            os: macos-12
+            bin_name: ${{ env.PROJECT_NAME }}-macos-arm
+            artifact_name: macos-arm
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        
+      - name: Install system dependencies
+        if: ${{ matrix.extra_packages || matrix.extra_actions }}
+        run: |
+          if [[ "${{ runner.os }}" == "Linux" && "${{ matrix.extra_packages }}" ]]; then
+            sudo apt-get update
+            sudo apt-get install -y ${{ matrix.extra_packages }}
+          fi
+          
+          if [[ "${{ runner.os }}" == "macOS" ]]; then
+            # macOS 可能需要特定依赖
+            brew install llvm || true
+          fi
+          
+          ${{ matrix.extra_actions }}
+
+      - name: Install nightly Rust
+        uses: actions-rs/toolchain@v1
+        with:
+          toolchain: nightly
+          components: rust-src, rustc-dev, llvm-tools-preview
+          target: ${{ matrix.rust_target }}
+          override: true
+
+      - name: Configure Cargo
+        shell: bash
+        run: |
+          if [ "${{ matrix.target }}" = "linux-musl" ]; then
+            echo "Configuring for static linking"
+            echo "RUSTFLAGS='-C target-feature=+crt-static'" >> $GITHUB_ENV
+            echo "CARGO_PROFILE_RELEASE_LTO = 'fat'" >> .cargo/config.toml
+            echo "CARGO_PROFILE_RELEASE_PANIC = 'abort'" >> .cargo/config.toml
+          fi
+          
+          # 启用 Z 卷压缩（文件体积优化）
+          echo "CARGO_PROFILE_RELEASE_CODEGEN_UNITS = 1" >> .cargo/config.toml
+          echo "CARGO_PROFILE_RELEASE_STRIP = true" >> .cargo/config.toml
+
+      - name: Build Release
+        env:
+          RUST_BACKTRACE: full
+          RUSTC_WRAPPER: sccache
+        run: |
+          cargo +nightly build \
+            --release \
+            --target ${{ matrix.rust_target }} \
+            -Z build-std=std,panic_abort \
+            -Z build-std-features=panic_immediate_abort
+          
+          # 使用 LLVM 工具减小文件大小
+          if command -v llvm-strip &> /dev/null; then
+            llvm-strip --strip-unneeded \
+              target/${{ matrix.rust_target }}/release/${{ env.PROJECT_NAME }}${{ format('{0}', '.exe') }}
+          fi
+
+      - name: Prepare Artifact
+        shell: bash
+        run: |
+          BIN_PATH="target/${{ matrix.rust_target }}/release/${{ env.PROJECT_NAME }}"
+          
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            mv "$BIN_PATH.exe" ${{ matrix.bin_name }}
+          else
+            mv "$BIN_PATH" ${{ matrix.bin_name }}
+          fi
+          
+          # 添加构建信息
+          sha256sum ${{ matrix.bin_name }} > ${{ matrix.bin_name }}.sha256
+          echo "Build date: ${{ env.BUILD_DATE }}" >> build-info.txt
+          echo "Target: ${{ matrix.rust_target }}" >> build-info.txt
+          echo "Rust version: $(cargo -V)" >> build-info.txt
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v3
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: |
+            ${{ matrix.bin_name }}
+            ${{ matrix.bin_name }}.sha256
+            build-info.txt
+
+  upload-release:
+    name: Publish Release Assets
+    runs-on: ubuntu-latest
+    needs: [create-release, build]
+    strategy:
+      matrix:
+        artifacts: [linux-gnu, linux-musl, windows, macos-intel, macos-arm]
+        
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v3
+        with:
+          path: artifacts
+          
+      - name: Package macOS Universal Binary
+        if: ${{ matrix.artifacts == 'macos-intel' }}
+        run: |
+          # 合并 intel 和 arm 二进制
+          lipo -create \
+            artifacts/macos-intel/${{ env.PROJECT_NAME }}-macos-intel \
+            artifacts/macos-arm/${{ env.PROJECT_NAME }}-macos-arm \
+            -output ${{ env.PROJECT_NAME }}-macos-universal
+          
+          sha256sum ${{ env.PROJECT_NAME }}-macos-universal > ${{ env.PROJECT_NAME }}-macos-universal.sha256
+
+      - name: Upload all assets
+        uses: softprops/action-gh-release@v1
+        with:
+          release_id: ${{ needs.create-release.outputs.release_id }}
+          files: |
+            artifacts/linux-gnu/${{ env.PROJECT_NAME }}-linux-x64
+            artifacts/linux-gnu/${{ env.PROJECT_NAME }}-linux-x64.sha256
+            artifacts/linux-musl/${{ env.PROJECT_NAME }}-linux-static
+            artifacts/linux-musl/${{ env.PROJECT_NAME }}-linux-static.sha256
+            artifacts/windows/${{ env.PROJECT_NAME }}-windows.exe
+            artifacts/windows/${{ env.PROJECT_NAME }}-windows.exe.sha256
+            ${{ env.PROJECT_NAME }}-macos-universal
+            ${{ env.PROJECT_NAME }}-macos-universal.sha256
+            artifacts/macos-intel/build-info.txt
+          
+      - name: Upload version info
+        run: |
+          echo "## Build Details" > details.md
+          cat artifacts/*/build-info.txt >> details.md
+          echo "\n### SHA256 Checksums" >> details.md
+          cat *.*sha256 >> details.md
+          
+        shell: bash
+        working-directory: artifacts
+
+      - name: Update release description
+        uses: mtsmfm/update-release@v1
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          release_id: ${{ needs.create-release.outputs.release_id }}
+          body_path: artifacts/details.md
