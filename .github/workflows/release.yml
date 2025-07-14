@@ -23,6 +23,8 @@ jobs:
   prepare:
     name: Prepare Release
     runs-on: ubuntu-latest
+    permissions:
+      contents: write  # 关键修复：添加写入权限
     outputs:
       version_tag: ${{ steps.set_version.outputs.version_tag }}
       build_date: ${{ steps.set_date.outputs.build_date }}
@@ -32,6 +34,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           fetch-depth: 0  # 获取完整历史记录
+          token: ${{ secrets.GITHUB_TOKEN }}  # 使用 token 进行 checkout
         if: ${{ !inputs.skip_tags }}
         
       - name: Set version
@@ -59,6 +62,11 @@ jobs:
         run: |
           git config user.name "GitHub Actions"
           git config user.email "actions@github.com"
+          
+          # 使用 token 进行认证
+          git remote set-url origin https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git
+          
+          # 创建并推送标签
           git tag ${{ steps.set_version.outputs.version_tag }} ${{ github.sha }}
           git push origin ${{ steps.set_version.outputs.version_tag }}
         env:
