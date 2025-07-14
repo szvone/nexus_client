@@ -106,12 +106,10 @@ jobs:
         uses: actions/checkout@v4
         
       - name: Install system dependencies
-        if: ${{ matrix.extra_packages }}
+        if: ${{ matrix.extra_packages && runner.os == 'Linux' }}
         run: |
-          if [[ "${{ runner.os }}" == "Linux" && "${{ matrix.extra_packages }}" ]]; then
-            sudo apt-get update
-            sudo apt-get install -y ${{ matrix.extra_packages }}
-          fi
+          sudo apt-get update
+          sudo apt-get install -y ${{ matrix.extra_packages }}
           
       - name: Install Rust nightly
         uses: dtolnay/rust-toolchain@master
@@ -119,36 +117,63 @@ jobs:
           toolchain: nightly
           targets: ${{ matrix.rust_target }}
           
-      - name: Build release
+      - name: Build release (Linux/macOS)
+        if: runner.os != 'Windows'
+        shell: bash
         run: |
+          # 修复的 Bash 脚本 - 移除了花括号语法问题
           cargo build --release --target ${{ matrix.rust_target }}
           
-          # 根据平台优化和移动文件
-          if [ "${{ runner.os }}" == "Windows" ]; then
-            # Windows 特殊处理
-            Move-Item "target/$env:RUST_TARGET/release/$env:PROJECT_NAME.exe" "$env:PROJECT_NAME-${{ matrix.bin_suffix }}"
-            if (Get-Command llvm-strip -ErrorAction SilentlyContinue) {
-                llvm-strip "$env:PROJECT_NAME-${{ matrix.bin_suffix }}"
-            }
-            elseif (Get-Command strip -ErrorAction SilentlyContinue) {
-                strip "$env:PROJECT_NAME-${{ matrix.bin_suffix }}"
-            }
-            $hash = Get-FileHash "$env:PROJECT_NAME-${{ matrix.bin_suffix }}" -Algorithm SHA256
-            $hash.Hash.ToLower() | Out-File "$env:PROJECT_NAME-${{ matrix.bin_suffix }}.sha256"
-          else
-            # Linux/macOS 处理
-            mv "target/${{ matrix.rust_target }}/release/${{ env.PROJECT_NAME }}" "${{ env.PROJECT_NAME }}-${{ matrix.bin_suffix }}"
-            
-            # 优化文件大小
-            if command -v llvm-strip >/dev/null 2>&1; then
-              llvm-strip "${{ env.PROJECT_NAME }}-${{ matrix.bin_suffix }}"
-            elif command -v strip >/dev/null 2>&1; then
-              strip "${{ env.PROJECT_NAME }}-${{ matrix.bin_suffix }}"
-            fi
-            
-            # 生成校验和
-            sha256sum "${{ env.PROJECT_NAME }}-${{ matrix.bin_suffix }}" > "${{ env.PROJECT_NAME }}-${{ matrix.bin_suffix }}.sha256"
+          # 移动文件
+          mv "target/${{ matrix.rust_target }}/release/${{ env.PROJECT_NAME }}" "${{ env.PROJECT_NAME }}-${{ matrix.bin_suffix }}"
+          
+          # 优化文件大小
+          if command -v llvm-strip > /dev/null 2>&1; then
+            llvm-strip "${{ env.PROJECT_NAME }}-${{ matrix.bin_suffix }}"
+          elif command -v strip > /dev/null 2>&1; then
+            strip "${{ env.PROJECT_NAME }}-${{ matrix.bin_suffix }}"
           fi
+          
+          # 生成校验和
+          sha256sum "${{ env.PROJECT_NAME }}-${{ matrix.bin_suffix }}" > "${{ env.PROJECT_NAME }}-${{ matrix.bin_suffix }}.sha256"
+          
+      - name: Build release (Windows)
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          # 构建 Windows 可执行文件
+          cargo build --release --target ${{ matrix.rust_target }}
+          
+          # 定义路径变量
+          $binPath = "target\${{ matrix.rust_target }}\release\$env:PROJECT_NAME.exe"
+          $outputName = "$env:PROJECT_NAME-${{ matrix.bin_suffix }}"
+          
+          # 检查文件是否存在
+          if (-not (Test-Path $binPath)) {
+              Write-Error "Binary not found at $binPath"
+              Exit 1
+          }
+          
+          # 移动文件
+          Move-Item -Path $binPath -Destination $outputName -Force
+          
+          # 检查并应用 strip
+          if (Get-Command llvm-strip -ErrorAction SilentlyContinue) {
+              llvm-strip $outputName
+              Write-Host "Binary size reduced with llvm-strip"
+          }
+          elseif (Get-Command strip -ErrorAction SilentlyContinue) {
+              strip $outputName
+              Write-Host "Binary size reduced with strip"
+          }
+          else {
+              Write-Host "No strip tools available, skipping size reduction"
+          }
+          
+          # 生成 SHA256 校验和
+          $hash = Get-FileHash $outputName -Algorithm SHA256
+          $hash.Hash.ToLower() | Out-File "$outputName.sha256"
+          Write-Host "Generated SHA256 checksum: $($hash.Hash.ToLower())"
         
       - uses: actions/upload-artifact@v4
         with:
