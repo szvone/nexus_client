@@ -1,41 +1,21 @@
 name: Rust Nightly Release
 
-# 优化后的触发条件 - 确保标签格式匹配
 on:
   push:
     tags:
-      - 'v[0-9]+.[0-9]+.[0-9]+'  # 匹配语义化版本标签 (v1.0.0)
-      - 'v[0-9]+.[0-9]+'          # 匹配简化版本标签 (v1.0)
+      - 'v[0-9]+.[0-9]+.[0-9]+'
+      - 'v[0-9]+.[0-9]+'
   workflow_dispatch:
     inputs:
       version:
         description: '手动指定版本号 (例如 1.0.0)'
         required: true
         default: '1.0.0'
-
-# 添加调试信息输出
+        
 env:
-  PROJECT_NAME: nexus_client
-  DEBUG_MODE: true
+  PROJECT_NAME: myapp
 
 jobs:
-  show_context:
-    name: Show Trigger Context
-    runs-on: ubuntu-latest
-    steps:
-      - name: Dump GitHub Context
-        run: |
-          echo "Event: ${{ github.event_name }}"
-          echo "Ref: ${{ github.ref }}"
-          echo "Ref type: ${{ github.ref_type }}"
-          echo "Ref name: ${{ github.ref_name }}"
-          
-          echo "HEAD commit:"
-          git log -1 --pretty=oneline
-          
-          echo "All tags:"
-          git tag --list
-
   build_prep:
     name: Prepare Build
     runs-on: ubuntu-latest
@@ -46,19 +26,14 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0  # 获取完整历史记录（包括标签）
+          fetch-depth: 0
           
       - name: Extract version from tag
         id: extract_version
         run: |
           TAG_NAME="${{ github.ref_name }}"
-          # 处理v前缀
           VERSION=${TAG_NAME#v}
           echo "version=$VERSION" >> $GITHUB_OUTPUT
-          
-          # 输出用于调试
-          echo "Tag name: $TAG_NAME"
-          echo "Extracted version: $VERSION"
           
       - name: Set build date
         id: set_date
@@ -74,7 +49,9 @@ jobs:
           echo "Git commit: ${{ github.sha }}" >> build-info.txt
           echo "Triggered by: ${{ github.actor }}" >> build-info.txt
           
-      - uses: actions/upload-artifact@v3
+      # 使用更新后的 artifact 上传方法
+      - name: Upload build info
+        uses: actions/upload-artifact@v4
         with:
           name: build-info
           path: build-info.txt
@@ -82,7 +59,7 @@ jobs:
   build:
     name: Build for ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
-    needs: [show_context, build_prep]
+    needs: build_prep
     strategy:
       fail-fast: false
       matrix:
@@ -90,12 +67,12 @@ jobs:
           # Linux 目标
           - target: linux-gnu
             rust_target: x86_64-unknown-linux-gnu
-            os: ubuntu-22.04
+            os: ubuntu-latest
             bin_suffix: linux
           
           - target: linux-musl
             rust_target: x86_64-unknown-linux-musl
-            os: ubuntu-22.04
+            os: ubuntu-latest
             bin_suffix: linux-static
             extra_packages: musl-tools
             
@@ -108,12 +85,12 @@ jobs:
           # macOS 目标
           - target: macos-intel
             rust_target: x86_64-apple-darwin
-            os: macos-12
+            os: macos-latest
             bin_suffix: macos-intel
             
           - target: macos-arm
             rust_target: aarch64-apple-darwin
-            os: macos-12
+            os: macos-latest
             bin_suffix: macos-arm
     
     steps:
@@ -121,75 +98,56 @@ jobs:
         uses: actions/checkout@v4
         
       - name: Download build info
-        uses: actions/download-artifact@v3
+        uses: actions/download-artifact@v4
         with:
           name: build-info
+          path: build-info
           
       - name: Install system dependencies
-        if: matrix.extra_packages || matrix.target == 'macos-intel' || matrix.target == 'macos-arm'
+        if: matrix.extra_packages
         run: |
-          echo "Installing dependencies for ${{ matrix.target }}..."
-          
-          # Linux 特定的依赖
           if [[ "${{ runner.os }}" == "Linux" && "${{ matrix.extra_packages }}" ]]; then
             sudo apt-get update
             sudo apt-get install -y ${{ matrix.extra_packages }}
           fi
           
-          # macOS 依赖
-          if [[ "${{ runner.os }}" == "macOS" ]]; then
-            brew update
-            brew install llvm || echo "LLVM already installed"
-          fi
-          
-          # Windows 依赖
-          if [[ "${{ runner.os }}" == "Windows" ]]; then
-            choco install llvm
-          fi
-          
       - name: Install Rust nightly
-        uses: actions-rs/toolchain@v1
+        uses: dtolnay/rust-toolchain@master
         with:
           toolchain: nightly
-          components: rust-src, rustc-dev, llvm-tools-preview
-          target: ${{ matrix.rust_target }}
-          override: true
-          profile: minimal
+          targets: ${{ matrix.rust_target }}
           
       - name: Build release
         run: |
-          # 显示环境信息用于调试
-          rustc -Vv
-          cargo -V
-          
-          # 构建项目
           cargo build --release --target ${{ matrix.rust_target }}
           
           # 减小文件大小
           if command -v llvm-strip &> /dev/null; then
             llvm-strip target/${{ matrix.rust_target }}/release/${{ env.PROJECT_NAME }}*
+          elif which strip > /dev/null; then
+            strip target/${{ matrix.rust_target }}/release/${{ env.PROJECT_NAME }}
           fi
           
       - name: Prepare artifact
         run: |
+          # 修复 Windows 文件名问题
           BIN_PATH="target/${{ matrix.rust_target }}/release/${{ env.PROJECT_NAME }}"
           OUTPUT_NAME="${{ env.PROJECT_NAME }}-${{ matrix.bin_suffix }}"
           
           if [ "${{ runner.os }}" == "Windows" ]; then
-            cp "$BIN_PATH.exe" "$OUTPUT_NAME"
+            mv "$BIN_PATH.exe" "$OUTPUT_NAME"
           else
-            cp "$BIN_PATH" "$OUTPUT_NAME"
+            mv "$BIN_PATH" "$OUTPUT_NAME"
           fi
           
           # 生成校验和
-          sha256sum "$OUTPUT_NAME" > "$OUTPUT_NAME.sha256"
-          
-          # 输出调试信息
-          echo "Bin path: $BIN_PATH"
-          echo "Output name: $OUTPUT_NAME"
-          ls -lh "$OUTPUT_NAME"
+          if [ "${{ runner.os }}" == "Windows" ]; then
+            certutil -hashfile "$OUTPUT_NAME" SHA256 | findstr -v ":" > "$OUTPUT_NAME.sha256"
+          else
+            sha256sum "$OUTPUT_NAME" > "$OUTPUT_NAME.sha256"
+          fi
         
-      - uses: actions/upload-artifact@v3
+      - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.target }}-binary
           path: |
@@ -202,12 +160,13 @@ jobs:
     needs: build
     steps:
       - name: Download build info
-        uses: actions/download-artifact@v3
+        uses: actions/download-artifact@v4
         with:
           name: build-info
+          path: build-info
           
       - name: Download all binaries
-        uses: actions/download-artifact@v3
+        uses: actions/download-artifact@v4
         with:
           path: artifacts
           pattern: '*-binary'
@@ -221,22 +180,26 @@ jobs:
           body: |
             # ${{ env.PROJECT_NAME }} ${{ needs.build_prep.outputs.version_tag }}
             
-            Built with Rust nightly
             Build date: ${{ needs.build_prep.outputs.build_date }}
             
-            ## Downloads
-            - Linux (glibc): ${{ env.PROJECT_NAME }}-linux
-            - Linux (static): ${{ env.PROJECT_NAME }}-linux-static
-            - Windows: ${{ env.PROJECT_NAME }}-windows.exe
-            - macOS Intel: ${{ env.PROJECT_NAME }}-macos-intel
-            - macOS ARM: ${{ env.PROJECT_NAME }}-macos-arm
-            
+            ## Download Assets
+            | Platform        | File                              |
+            |-----------------|-----------------------------------|
+            | Linux (glibc)   | `${{ env.PROJECT_NAME }}-linux`       |
+            | Linux (static)  | `${{ env.PROJECT_NAME }}-linux-static`|
+            | Windows         | `${{ env.PROJECT_NAME }}-windows.exe` |
+            | macOS Intel     | `${{ env.PROJECT_NAME }}-macos-intel` |
+            | macOS ARM       | `${{ env.PROJECT_NAME }}-macos-arm`   |
           draft: false
           prerelease: false
           files: |
-            artifacts/*.sha256
             artifacts/linux-gnu-binary/${{ env.PROJECT_NAME }}-linux
+            artifacts/linux-gnu-binary/${{ env.PROJECT_NAME }}-linux.sha256
             artifacts/linux-musl-binary/${{ env.PROJECT_NAME }}-linux-static
+            artifacts/linux-musl-binary/${{ env.PROJECT_NAME }}-linux-static.sha256
             artifacts/windows-binary/${{ env.PROJECT_NAME }}-windows.exe
+            artifacts/windows-binary/${{ env.PROJECT_NAME }}-windows.exe.sha256
             artifacts/macos-intel-binary/${{ env.PROJECT_NAME }}-macos-intel
+            artifacts/macos-intel-binary/${{ env.PROJECT_NAME }}-macos-intel.sha256
             artifacts/macos-arm-binary/${{ env.PROJECT_NAME }}-macos-arm
+            artifacts/macos-arm-binary/${{ env.PROJECT_NAME }}-macos-arm.sha256
