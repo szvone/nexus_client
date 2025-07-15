@@ -14,7 +14,7 @@ postcard = "1.0.10"
 prost = "0.13"
 prost-types = "0.13.5"
 ed25519-dalek = { version = "2", features = ["rand_core"] }
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 sysinfo = "0.33.1"
 cfg-if = "1.0"
 serde = { version = "1.0.217", features = ["derive"] }
@@ -32,6 +32,10 @@ mimalloc = "0.1"
 log = "0.4"
 env_logger = "0.10" # 可选，用于日志记录
 serde_yaml = "0.9"
+mac_address = "1.1.5"
+uuid = { version = "1.0", features = ["v4"] }
+systemstat = "0.2.0"
+
 
 [dev-dependencies]
 assert_cmd = "2"

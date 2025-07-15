@@ -9,10 +9,14 @@ use crate::environment::Environment;
 use crate::orchestrator::{Orchestrator, OrchestratorClient};
 use crate::prover::ProveResult;
 use ed25519_dalek::SigningKey;
-use reqwest::{Client, Error as ReqwestError};
+use mac_address::get_mac_address;
+use reqwest::{Client, Error as ReqwestError, blocking::Client as blockingClient};
 use serde::{Deserialize, Serialize};
 use std::fs::File;
 use std::io::Read;
+use std::{string, thread};
+use systemstat::{Platform, System};
+use uuid::Uuid;
 
 use std::time::Duration;
 use tokio::time::sleep;
@@ -47,10 +51,18 @@ struct Config {
     host: String,
     port: u16,
 }
+
+#[derive(Serialize)]
+struct HeartbeatData {
+    client_uuid: String,
+    client_key: String,
+    cpu: u32,
+    memory: u32,
+}
+
 #[tokio::main]
 async fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
-
 
     // 文件读取处理
     let contents = match std::fs::read_to_string("./nexus_client.txt") {
@@ -74,13 +86,30 @@ async fn main() {
         }
     };
 
+    // 生成随机UUID
+    let uuid = Uuid::new_v4().to_string();
+    log::info!("客户端编号: {}", uuid);
+
+    // 获取MAC地址
+    let mac_address = get_mac_address()
+        .expect("Failed to get MAC address")
+        .map(|addr| addr.to_string().to_uppercase())
+        .unwrap_or_else(|| "UNKNOWN-MAC".to_string());
+
+    log::info!("客户端标识: {}", mac_address);
+
     // 使用配置
     log::info!("服务端地址: {}", config.host);
     log::info!("服务端端口: {}", config.port);
 
-    log::info!("分布式计算节点启动！");
     let pick_url = format!("http://{}:{}/tasks/pick", config.host, config.port);
     let submit_url = format!("http://{}:{}/tasks/submit", config.host, config.port);
+    let heart_url = format!("http://{}:{}/tasks/clientHeart", config.host, config.port);
+    // 启动心跳线程
+    thread::spawn(move || {
+        heartbeat_loop(heart_url.clone(), uuid.clone(), mac_address.clone());
+    });
+    log::info!("分布式计算节点启动！");
 
     let http_client = Client::new();
 
@@ -111,9 +140,17 @@ async fn main() {
                 log::info!("回传结果: {:?}", response.result);
 
                 // Send result to API2
-                if let Err(e) = http_client.post(submit_url.clone()).json(&response).send().await {
+                if let Err(e) = http_client
+                    .post(submit_url.clone())
+                    .json(&response)
+                    .send()
+                    .await
+                {
                     // eprintln!("Failed to send results to API2: {}", e);
-                    log::info!("与任务分发服务器通讯失败，请检查配置文件的端口和IP是否正确！ {:?}", e);
+                    log::info!(
+                        "与任务分发服务器通讯失败，请检查配置文件的端口和IP是否正确！ {:?}",
+                        e
+                    );
                 }
             }
             Ok(None) => {
@@ -121,7 +158,10 @@ async fn main() {
                 sleep(Duration::from_secs(5)).await;
             }
             Err(e) => {
-                log::info!("与任务分发服务器通讯失败，请检查配置文件的端口和IP是否正确！ {:?}", e);
+                log::info!(
+                    "与任务分发服务器通讯失败，请检查配置文件的端口和IP是否正确！ {:?}",
+                    e
+                );
 
                 // log::info!("与任务分发服务器通讯失败，等待10秒...");
                 // eprintln!("Error fetching task: {}. Retrying...", e);
@@ -134,17 +174,15 @@ async fn main() {
 // 等待用户按回车键的函数
 fn wait_for_enter() {
     use std::io::{self, Write};
-    
+
     let mut input = String::new();
     print!("\n发生错误，按回车键退出...");
     io::stdout().flush().expect("刷新输出失败");
-    io::stdin()
-        .read_line(&mut input)
-        .expect("读取输入失败");
+    io::stdin().read_line(&mut input).expect("读取输入失败");
 }
 
 async fn fetch_task(client: &Client, url: String) -> Result<Option<TaskRequest>, ReqwestError> {
-    let response = client.get(url).send().await?;
+    let response: reqwest::Response = client.get(url).send().await?;
 
     if response.status().is_success() {
         let payload: TaskRequest = response.json().await?;
@@ -233,5 +271,92 @@ async fn handle_proof(task: &TaskRequest, proof: &ProveResult) -> Api2Response {
                 },
             }
         }
+    }
+}
+
+fn heartbeat_loop(api: String, client_uuid: String, client_key: String) {
+    let http_client = blockingClient::new();
+    let sys = System::new();
+
+    loop {
+        // 获取系统资源使用情况并转换为整数
+        let cpu_usage = get_cpu_usage(&sys).unwrap_or(0);
+        let mem_usage = get_memory_usage(&sys).unwrap_or(0);
+
+        // println!(
+        //     "Uploading: CPU {}%, Mem {}%",
+        //     cpu_usage, mem_usage
+        // );
+
+        // 准备心跳数据
+        let data = HeartbeatData {
+            client_uuid: client_uuid.clone(),
+            client_key: client_key.clone(),
+            cpu: cpu_usage,
+            memory: mem_usage,
+        };
+
+        // 发送心跳请求
+        if let Err(e) = send_heartbeat(api.clone(), &http_client, &data) {
+            log::info!("与服务端通讯失败 {:?}", e);
+            // eprintln!("Error sending heartbeat: {}", e);
+        }
+
+        // 等待30秒
+        thread::sleep(Duration::from_secs(5));
+    }
+}
+
+fn get_cpu_usage(sys: &System) -> Result<u32, String> {
+    let sample = sys
+        .cpu_load()
+        .map_err(|e| format!("Failed to get CPU load: {}", e))?;
+
+    // 等待1秒获取准确的CPU使用率
+    thread::sleep(Duration::from_secs(1));
+
+    let usage = sample
+        .done()
+        .map_err(|e| format!("Failed to calculate CPU usage: {}", e))?;
+
+    let mut total_usage = 0.0;
+    for cpu in &usage {
+        total_usage += (1.0 - cpu.idle) as f64;
+    }
+
+    // 计算平均CPU使用率并转为整数
+    let avg_usage = (total_usage / usage.len() as f64) * 100.0;
+    Ok(avg_usage.round() as u32)
+}
+
+fn get_memory_usage(sys: &System) -> Result<u32, String> {
+    let mem = sys
+        .memory()
+        .map_err(|e| format!("Failed to get memory info: {}", e))?;
+
+    let used = (mem.total.as_u64() - mem.free.as_u64()) as f64;
+    let total = mem.total.as_u64() as f64;
+
+    // 计算内存使用率并转为整数
+    let usage_percentage = (used / total) * 100.0;
+    Ok(usage_percentage.round() as u32)
+}
+fn send_heartbeat(
+    api: String,
+    http_client: &blockingClient,
+    data: &HeartbeatData,
+) -> Result<(), String> {
+    // 错误处理应该使用简单模式而不是链式调用
+    let response = http_client.post(api).json(data).send();
+
+    match response {
+        Ok(res) => {
+            if res.status().is_success() {
+                Ok(())
+            } else {
+                Err(format!("Server returned error status: {}", res.status()))
+            }
+        }
+        Err(e) => Err(format!("HTTP request failed: {}", e)),
     }
 }
