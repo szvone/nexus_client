@@ -69,7 +69,7 @@ async fn main() {
         Ok(c) => c,
         Err(e) => {
             log::error!("配置文件读取失败: {}", e);
-            log::warn!("请检查文件路径或权限设置");
+            log::warn!("请检查文件 nexus_client.txt 是否存在或权限设置");
             wait_for_enter();
             return;
         }
@@ -80,7 +80,7 @@ async fn main() {
         Ok(c) => c,
         Err(e) => {
             log::error!("YAML解析失败: {}", e);
-            log::warn!("请检查配置文件格式是否正确");
+            log::warn!("请检查配置文件 nexus_client.txt 格式是否正确");
             wait_for_enter();
             return;
         }
@@ -298,7 +298,7 @@ fn heartbeat_loop(api: String, client_uuid: String, client_key: String) {
 
         // 发送心跳请求
         if let Err(e) = send_heartbeat(api.clone(), &http_client, &data) {
-            log::info!("与服务端通讯失败 {:?}", e);
+            log::info!("心跳请求与服务端通讯失败 {:?}", e);
             // eprintln!("Error sending heartbeat: {}", e);
         }
 
@@ -351,10 +351,20 @@ fn send_heartbeat(
 
     match response {
         Ok(res) => {
-            if res.status().is_success() {
+            let status = res.status(); // 先获取状态码
+            if status.is_success() {
                 Ok(())
             } else {
-                Err(format!("Server returned error status: {}", res.status()))
+                match res.text() {
+                    Ok(body) => Err(format!(
+                        "Server returned error status: {}\nResponse body: {}",
+                        status, body
+                    )),
+                    Err(e) => Err(format!(
+                        "Server returned error status: {} but failed to read response body: {}",
+                        status, e
+                    )),
+                }
             }
         }
         Err(e) => Err(format!("HTTP request failed: {}", e)),
