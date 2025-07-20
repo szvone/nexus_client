@@ -37,6 +37,13 @@ impl OrchestratorError {
 
         OrchestratorError::Http { status, message }
     }
+    /// 提取HTTP错误消息（仅当错误类型为Http时有效）
+    pub fn http_message(&self) -> Option<&str> {
+        match self {
+            OrchestratorError::Http { message, .. } => Some(message),
+            _ => None,
+        }
+    }
 
     pub fn to_pretty(&self) -> Option<String> {
         match self {

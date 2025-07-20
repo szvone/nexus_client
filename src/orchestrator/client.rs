@@ -5,7 +5,8 @@
 use crate::environment::Environment;
 use crate::nexus_orchestrator::{
     GetProofTaskRequest, GetProofTaskResponse, GetTasksResponse, NodeType, RegisterNodeRequest,
-    RegisterNodeResponse, RegisterUserRequest, SubmitProofRequest, UserResponse,SubmitProofResponse
+    RegisterNodeResponse, RegisterUserRequest, SubmitProofRequest, SubmitProofResponse,
+    UserResponse,
 };
 use crate::orchestrator::Orchestrator;
 use crate::orchestrator::error::OrchestratorError;
@@ -81,17 +82,45 @@ impl OrchestratorClient {
         body: Vec<u8>,
     ) -> Result<T, OrchestratorError> {
         let url = self.build_url(endpoint);
-        let response = self
-            .client
-            .post(&url)
-            .header("Content-Type", "application/octet-stream")
-            .body(body)
-            .send()
-            .await?;
+        let mut attempt = 0;
+        const MAX_ATTEMPTS: usize = 3; // 初始请求 + 1次重试
 
-        let response = Self::handle_response_status(response).await?;
-        let response_bytes = response.bytes().await?;
-        Self::decode_response(&response_bytes)
+        loop {
+            attempt += 1;
+
+            // 构建请求
+            let request = self
+                .client
+                .post(&url)
+                .header("Content-Type", "application/octet-stream")
+                .body(body.clone()); // 克隆 body 用于可能的多次尝试
+
+            // 发送请求并处理响应
+            match request.send().await {
+                Ok(response) => {
+                    let response = Self::handle_response_status(response).await?;
+                    let response_bytes = response.bytes().await?;
+                    return Self::decode_response(&response_bytes);
+                }
+                Err(e) => {
+                    // 判断是否为超时错误
+                    let is_timeout = e.is_timeout();
+
+                    // log::warn!(
+                    //     "请求失败 (尝试 {}/{}): {} - URL: {}",
+                    //     attempt,
+                    //     MAX_ATTEMPTS,
+                    //     e,
+                    //     url
+                    // );
+
+                    // 如果不是超时错误或者已达最大尝试次数，直接返回错误
+                    if !is_timeout || attempt >= MAX_ATTEMPTS {
+                        return Err(OrchestratorError::Reqwest(e));
+                    }
+                }
+            }
+        }
     }
 
     async fn post_request_no_response(
@@ -299,7 +328,8 @@ impl Orchestrator for OrchestratorClient {
             signature,
         };
         let request_bytes = Self::encode_request(&request);
-        let response: SubmitProofResponse = self.post_request("v3/tasks/submit", request_bytes).await?;
+        let response: SubmitProofResponse =
+            self.post_request("v3/tasks/submit", request_bytes).await?;
 
         Ok(response.node_point)
     }

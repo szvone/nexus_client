@@ -6,19 +6,17 @@ pub mod system;
 mod task;
 
 use crate::environment::Environment;
+use crate::orchestrator::error::OrchestratorError;
 use crate::orchestrator::{Orchestrator, OrchestratorClient};
 use crate::prover::ProveResult;
 use ed25519_dalek::SigningKey;
 use mac_address::get_mac_address;
 use reqwest::{Client, Error as ReqwestError, blocking::Client as blockingClient};
 use serde::{Deserialize, Serialize};
-use std::fs::File;
-use std::io::Read;
-use std::{string, thread};
+use std::thread;
 use systemstat::{Platform, System};
 use uuid::Uuid;
-
-use std::time::Duration;
+use std::time::{Instant, Duration};
 use tokio::time::sleep;
 
 use mimalloc::MiMalloc;
@@ -109,26 +107,30 @@ async fn main() {
     thread::spawn(move || {
         heartbeat_loop(heart_url.clone(), uuid.clone(), mac_address.clone());
     });
-    log::info!("分布式计算节点启动！");
+    log::info!("客户端启动: 初始化完成，计算节点启动！");
 
     let http_client = Client::new();
 
     loop {
+        log::info!("-------------------------------------------");
+
         match fetch_task(&http_client, pick_url.clone()).await {
             Ok(Some(payload)) => {
-                log::info!("读取到计算任务: {:?}", payload.task_id);
+                log::info!("获取计算任务: {}", payload.task_id);
+                let start_time = Instant::now();
 
                 let task = prover::Task::from(payload.clone());
                 let result = prover::prove_task(task);
 
                 let response = match result {
                     Ok(proof) => {
-                        log::info!("计算成功: {:?}", payload.task_id);
+                        let elapsed_ms = start_time.elapsed().as_millis();
+                        log::info!("任务计算成功: 计算耗时 {} 毫秒 ", elapsed_ms);
                         handle_proof(&payload, &proof).await
                     }
                     Err(err) => {
-                        log::info!("计算失败: {:?}", err);
                         let error = format!("Proof generation failed: {}", err);
+                        log::info!("任务计算失败: {}", error);
                         Api2Response {
                             task_id: payload.task_id.clone(),
                             result: error,
@@ -137,8 +139,6 @@ async fn main() {
                     }
                 };
 
-                log::info!("回传结果: {:?}", response.result);
-
                 // Send result to API2
                 if let Err(e) = http_client
                     .post(submit_url.clone())
@@ -146,28 +146,23 @@ async fn main() {
                     .send()
                     .await
                 {
-                    // eprintln!("Failed to send results to API2: {}", e);
-                    log::info!(
-                        "与任务分发服务器通讯失败，请检查配置文件的端口和IP是否正确！ {:?}",
-                        e
-                    );
+                    log::info!("回传任务结果: 失败-> {:?}", e);
+                } else {
+                    log::info!("回传任务结果: 回传数据成功！");
                 }
             }
             Ok(None) => {
-                log::info!("没有计算任务，等待5秒...");
+                log::info!("获取计算任务: 没有计算任务，等待5秒！");
                 sleep(Duration::from_secs(5)).await;
             }
             Err(e) => {
-                log::info!(
-                    "与任务分发服务器通讯失败，请检查配置文件的端口和IP是否正确！ {:?}",
-                    e
-                );
+                
+                log::info!("获取计算任务: 失败，请检查IP端口是否正确，服务端是否运行!");
 
-                // log::info!("与任务分发服务器通讯失败，等待10秒...");
-                // eprintln!("Error fetching task: {}. Retrying...", e);
                 sleep(Duration::from_secs(10)).await;
             }
         }
+        log::info!("-------------------------------------------");
     }
 }
 
@@ -240,14 +235,45 @@ async fn handle_proof(task: &TaskRequest, proof: &ProveResult) -> Api2Response {
         )
         .await
     {
-        Ok(node_point) => Api2Response {
-            task_id: task.task_id.clone(),
-            credits: node_point,
-            result: "success".to_owned(),
-        },
+        Ok(node_point) => {
+            log::info!("任务提交结果: 提交成功");
+
+            return Api2Response {
+                task_id: task.task_id.clone(),
+                credits: node_point,
+                result: "success".to_owned(),
+            };
+        }
         Err(e) => {
-            log::info!("任务结果提交失败 {:?}", e);
-            log::info!("尝试重新提交...");
+            if let Some(msg) = e.http_message() {
+                if msg.contains("Task not found") {
+                    log::info!("任务提交结果: 任务不存在，可能入库太久已失效！");
+                    return Api2Response {
+                        task_id: task.task_id.clone(),
+                        credits: 0,
+                        result: format!("{}", e),
+                    };
+                } else if msg.contains(":429}") {
+                    log::info!("任务提交结果: 提交频繁，回传后将重新分配！");
+                    return Api2Response {
+                        task_id: task.task_id.clone(),
+                        credits: 0,
+                        result: format!("{}", e),
+                    };
+                }
+            }
+
+            // 检查是否是 Reqwest 超时错误
+            if let OrchestratorError::Reqwest(ref reqwest_err) = e {
+                if reqwest_err.is_timeout() {
+                    log::info!("任务提交结果: 提交失败，请求超时！");
+                } else {
+                    log::info!("任务提交结果: 失败-> {:?}", e);
+                }
+            } else {
+                log::info!("任务提交结果: 失败-> {:?}", e);
+            }
+            log::info!("尝试重新提交: 提交中...");
 
             match client
                 .submit_proof(
@@ -259,16 +285,55 @@ async fn handle_proof(task: &TaskRequest, proof: &ProveResult) -> Api2Response {
                 )
                 .await
             {
-                Ok(node_point) => Api2Response {
-                    task_id: task.task_id.clone(),
-                    credits: node_point,
-                    result: "success".to_owned(),
-                },
-                Err(e) => Api2Response {
-                    task_id: task.task_id.clone(),
-                    credits: 0,
-                    result: format!("{}", e),
-                },
+                Ok(node_point) => {
+                    log::info!("任务提交结果: 提交成功");
+
+                    return Api2Response {
+                        task_id: task.task_id.clone(),
+                        credits: node_point,
+                        result: "success".to_owned(),
+                    };
+                }
+                Err(e) => {
+                    if let Some(msg) = e.http_message() {
+                        if msg.contains("Task not found") {
+                            log::info!("重新提交失败: 任务不存在，可能入库太久已失效！");
+                            return Api2Response {
+                                task_id: task.task_id.clone(),
+                                credits: 0,
+                                result: format!("{}", e),
+                            };
+                        } else if msg.contains(":429}") {
+                            log::info!("重新提交失败: 提交频繁，回传后将重新分配！");
+                            return Api2Response {
+                                task_id: task.task_id.clone(),
+                                credits: 0,
+                                result: format!("{}", e),
+                            };
+                        }
+                    }
+                    // 检查是否是 Reqwest 超时错误
+                    if let OrchestratorError::Reqwest(ref reqwest_err) = e {
+                        if reqwest_err.is_timeout() {
+                            log::info!("重新提交失败: 提交失败，请求超时！");
+                            return Api2Response {
+                                task_id: task.task_id.clone(),
+                                credits: 0,
+                                result: format!("{}", e),
+                            };
+                        } else {
+                            log::info!("重新提交失败: 失败-> {:?}", e);
+                        }
+                    } else {
+                        log::info!("重新提交失败: 失败-> {:?}", e);
+                    }
+
+                    return Api2Response {
+                        task_id: task.task_id.clone(),
+                        credits: 0,
+                        result: format!("{}", e),
+                    };
+                }
             }
         }
     }
@@ -298,7 +363,7 @@ fn heartbeat_loop(api: String, client_uuid: String, client_key: String) {
 
         // 发送心跳请求
         if let Err(e) = send_heartbeat(api.clone(), &http_client, &data) {
-            log::info!("心跳请求与服务端通讯失败 {:?}", e);
+            log::info!("心跳请求与服务端通讯失败，请检查IP端口！");
             // eprintln!("Error sending heartbeat: {}", e);
         }
 
@@ -346,7 +411,6 @@ fn send_heartbeat(
     http_client: &blockingClient,
     data: &HeartbeatData,
 ) -> Result<(), String> {
-    // 错误处理应该使用简单模式而不是链式调用
     let response = http_client.post(api).json(data).send();
 
     match response {
