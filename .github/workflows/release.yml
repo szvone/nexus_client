@@ -18,6 +18,8 @@ on:
 
 env:
   PROJECT_NAME: nexus_client
+  # Set the default Rust toolchain to use for all jobs
+  RUSTUP_TOOLCHAIN: nightly-2025-04-06
 
 jobs:
   prepare:
@@ -124,8 +126,17 @@ jobs:
       - name: Install Rust nightly
         uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: nightly
+          toolchain: ${{ env.RUSTUP_TOOLCHAIN }}
           targets: ${{ matrix.rust_target }}
+          components: rustfmt
+      
+      - name: Debug Rust environment
+        run: |
+          echo "Rust version: $(rustc --version --verbose)"
+          echo "Cargo version: $(cargo --version)"
+          echo "Rustup installed targets: $(rustup target list --installed | tr '\n' ',' | sed 's/,$//')"
+          echo "Rustup active toolchain: $(rustup show active-toolchain)"
+          echo "Host target: $(rustc -vV | grep host)"
           
       - name: Build release (Linux)
         if: runner.os == 'Linux'
