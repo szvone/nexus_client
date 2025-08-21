@@ -63,6 +63,45 @@ struct HeartbeatData {
     memory: u32,
 }
 
+/// Proof submission data grouped by business concern
+#[derive(Debug, Clone)]
+pub struct ProofSubmission {
+    pub task_id: String,
+    pub proof_hash: String,
+    pub proof_bytes: Vec<u8>,
+    pub task_type: crate::nexus_orchestrator::TaskType,
+    pub individual_proof_hashes: Vec<String>,
+    pub proofs_bytes: Vec<Vec<u8>>, // new: full proofs array
+}
+
+impl ProofSubmission {
+    pub fn new(
+        task_id: String,
+        proof_hash: String,
+        proof_bytes: Vec<u8>,
+        task_type: crate::nexus_orchestrator::TaskType,
+    ) -> Self {
+        Self {
+            task_id,
+            proof_hash,
+            proof_bytes,
+            task_type,
+            individual_proof_hashes: Vec::new(),
+            proofs_bytes: Vec::new(),
+        }
+    }
+
+    pub fn with_individual_hashes(mut self, hashes: Vec<String>) -> Self {
+        self.individual_proof_hashes = hashes;
+        self
+    }
+
+    pub fn with_proofs(mut self, proofs: Vec<Vec<u8>>) -> Self {
+        self.proofs_bytes = proofs;
+        self
+    }
+}
+
 #[tokio::main]
 async fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
@@ -126,11 +165,15 @@ async fn main() {
                 log::info!("-------------------------------------------");
 
                 log::info!("获取计算任务: {}", payload.task_id);
-
+                log::info!(
+                    "计算任务详情: 类型{} 难度{}",
+                    payload.task_type,
+                    payload.public_inputs_list.len()
+                );
                 let task = prover::Task::from(payload.clone());
                 // let result: Result<ProverResult, anyhow::Error> = prover::prove_task(task);
-                let result: Result<ProverResult, anyhow::Error> =
-                    prover::prove_task2(task, Some(3));
+                let result: Result<ProverResult, anyhow::Error> = prover::prove_task2(task,Some(3));
+                
 
                 let response = match result {
                     Ok(proof) => {
@@ -262,32 +305,48 @@ async fn handle_proof(task: &TaskRequest, proof: &ProverResult) -> Api2Response 
         }
     };
     // let proof_bytes = postcard::to_allocvec(&proof.proof).unwrap();
-    let proof_bytes = match &proof.proof {
-        Some(data) => postcard::to_allocvec(data).unwrap(),
-        None => {
-            // 生成32字节随机数
-            let mut rng = rand::thread_rng();
-            let mut random_bytes = [0u8; 32];
-            rng.fill(&mut random_bytes);
-            random_bytes.to_vec()
-        }
-    };
+    let proofs_bytes: Vec<Vec<u8>> = proof
+        .proof
+        .iter()
+        .map(postcard::to_allocvec)
+        .collect::<Result<_, _>>()
+        .unwrap();
+    let legacy_proof_bytes = proofs_bytes.first().cloned().unwrap_or_default();
 
-    
     let task_type = TaskType::try_from(task.task_type).unwrap_or_else(|_| {
         log::warn!("Invalid TaskType, defaulting to ProofRequired");
         TaskType::ProofHash
     });
+
+    // Submit through network client with retry logic
+    let mut submission = ProofSubmission::new(
+        task.task_id.clone(),
+        proof.combined_hash.clone(),
+        legacy_proof_bytes,
+        task_type,
+    );
+
+    // Populate individual hashes for ALL_PROOF_HASHES and optionally for ProofHash
+    if task_type == crate::nexus_orchestrator::TaskType::AllProofHashes {
+        submission = submission.with_individual_hashes(proof.individual_proof_hashes.clone());
+    }
+
+    // Populate proofs for PROOF_REQUIRED; leave empty otherwise
+    if task_type == crate::nexus_orchestrator::TaskType::ProofRequired {
+        submission = submission.with_proofs(proofs_bytes);
+    }
+
     let client = OrchestratorClient::new(Environment::Beta);
     match client
         .submit_proof(
-            &task.task_id,
-            &proof.combined_hash.clone(),
-            proof_bytes.clone(),
+            &submission.task_id,
+            &submission.proof_hash,
+            submission.proof_bytes.clone(),
+            submission.proofs_bytes.clone(),
             signing_key.clone(),
-            5,
+            1,
             task_type,
-            &proof.proof_hashes.clone(),
+            &submission.individual_proof_hashes,
         )
         .await
     {
@@ -333,13 +392,14 @@ async fn handle_proof(task: &TaskRequest, proof: &ProverResult) -> Api2Response 
 
             match client
                 .submit_proof(
-                    &task.task_id,
-                    &proof.combined_hash.clone(),
-                    proof_bytes.clone(),
+                    &submission.task_id,
+                    &submission.proof_hash,
+                    submission.proof_bytes.clone(),
+                    submission.proofs_bytes.clone(),
                     signing_key.clone(),
-                    5,
+                    1,
                     task_type,
-                    &proof.proof_hashes.clone(),
+                    &submission.individual_proof_hashes,
                 )
                 .await
             {

@@ -1,5 +1,5 @@
 use crate::{nexus_orchestrator::TaskType, verifier};
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Context, Result};
 use base64::engine::Engine; // 引入Engine trait
 use base64::engine::general_purpose::STANDARD as BASE64;
 use hex;
@@ -17,9 +17,9 @@ use std::convert::TryInto;
 
 #[derive(Serialize, Deserialize)]
 pub struct ProverResult {
-    pub proof: Option<Proof>,
+    pub proof: Vec<Proof>,
     pub combined_hash: String,
-    pub proof_hashes: Vec<String>,
+    pub individual_proof_hashes: Vec<String>,
 }
 
 #[derive(Debug)]
@@ -103,7 +103,7 @@ pub fn prove_task(task: Task) -> Result<ProverResult> {
     let all_inputs = task.public_inputs_list.clone();
 
     let mut proof_hashes = Vec::new();
-    let mut final_proof = None;
+    let mut all_proofs: Vec<Proof> = Vec::new();
 
     for (input_index, input_data) in all_inputs.iter().enumerate() {
         // Step 1: Parse and validate input
@@ -118,98 +118,64 @@ pub fn prove_task(task: Task) -> Result<ProverResult> {
         // Step 3: Generate proof hash
         let proof_hash = generate_proof_hash(&proof);
         proof_hashes.push(proof_hash);
-        final_proof = Some(proof);
+        all_proofs.push(proof);
     }
 
     let final_proof_hash = combine_proof_hashes(&task, &proof_hashes);
 
     Ok(ProverResult {
-        proof: Some(final_proof.unwrap()),
+        proof: all_proofs,
         combined_hash: final_proof_hash,
-        proof_hashes,
+        individual_proof_hashes: proof_hashes,
     })
 }
 
-pub fn prove_task2(task: Task, max_threads: Option<usize>) -> Result<ProverResult> {
+pub fn prove_task2(task: Task, num_threads: Option<usize>) -> Result<ProverResult> {
     let all_inputs = task.public_inputs_list.clone();
 
-    // 特殊处理空输入的情况
-    if all_inputs.is_empty() {
-        return Ok(ProverResult {
-            proof: None,
-            combined_hash: combine_proof_hashes(&task, &[]),
-            proof_hashes: vec![],
-        });
-    }
-
-    // 创建带有线程限制的线程池
-    let pool = ThreadPoolBuilder::new()
-        .num_threads(max_threads.unwrap_or_else(|| {
-            let cores = num_cpus::get();
-            cores.min(16)
-        }))
-        .build()
-        .map_err(|e| anyhow!("Failed to create thread pool: {}", e))?;
-
-    // 并行处理所有输入并保持顺序
-    let mut results = pool.install(|| {
-        all_inputs
-            .par_iter()
-            .enumerate()
-            .map(|(input_index, input_data)| {
-                let inputs = parse_triple_input(input_data)?;
-                let proof = prove_and_validate(&inputs)?;
-
-                // 立即释放不再需要的大内存对象
-                drop(inputs); // 显式释放输入数据
-
-                // 返回最小必要数据
-                Ok((input_index, proof))
-            })
-            .collect::<Result<Vec<_>>>()
-    })?;
-
-    // 按原始输入顺序排序
-    results.sort_by_key(|(idx, _)| *idx);
-
-    // 生成proof_hashes
-    let mut proof_hashes = Vec::with_capacity(results.len());
-
-    // 提前提取最终证明并释放其他证明
-    let final_proof = if let Some((_, last_proof)) = results.pop() {
-        // 处理除最后一个证明外的所有证明
-        for (_, proof) in results.drain(..) {
-            let hash = generate_proof_hash(&proof);
-            proof_hashes.push(hash);
-
-            // 显式释放证明对象
-            drop(proof);
+    // 设置并行配置
+    let config = || -> Result<()> {
+        if let Some(num) = num_threads {
+            // 指定线程数时，创建自定义线程池
+            ThreadPoolBuilder::new()
+                .num_threads(num)
+                .build_global()
+                .context("Failed to build thread pool")?;
         }
-
-        // 单独处理最后一个证明
-        let hash = generate_proof_hash(&last_proof);
-
-
-        proof_hashes.push(hash);
-
-        Some(last_proof)
-    } else {
-        None
+        Ok(())
     };
+    config()?;
 
-    // 显式释放结果列表（此时已为空）
-    drop(results);
+    // 使用并行迭代器处理输入
+    let processed: Result<Vec<_>> = all_inputs
+        .par_iter() // 自动使用配置的线程池
+        .enumerate()
+        .map(|(input_index, input_data)| {
+            // Step 1: Parse and validate input
+            let inputs = parse_triple_input(input_data)?;
 
-    let combined_hash = combine_proof_hashes(&task, &proof_hashes);
+            // Step 2: Generate and verify proof
+            let proof = prove_and_validate(&inputs)?;
 
-    // 返回结果前显式释放大对象
-    let result = ProverResult {
-        proof: final_proof,
-        combined_hash,
-        proof_hashes,
-    };
+            // Step 3: Generate proof hash
+            let proof_hash = generate_proof_hash(&proof);
 
-    Ok(result)
+            Ok((proof, proof_hash))
+        })
+        .collect();
+
+    let processed = processed?;
+
+    // 分离结果并保持原始顺序
+    let (all_proofs, proof_hashes): (Vec<_>, Vec<_>) = processed.into_iter().unzip();
+
+    let final_proof_hash = combine_proof_hashes(&task, &proof_hashes);
+
+    Ok(ProverResult {
+        proof: all_proofs,
+        combined_hash: final_proof_hash,
+        individual_proof_hashes: proof_hashes,
+    })
 }
 /// Combine multiple proof hashes based on task type
 fn combine_proof_hashes(task: &Task, proof_hashes: &[String]) -> String {

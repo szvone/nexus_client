@@ -19,16 +19,18 @@ use std::sync::OnceLock;
 use tokio::time::{Duration, timeout};
 
 // Build timestamp in milliseconds since epoch
-static BUILD_TIMESTAMP: &str = "1755272024349";
+static BUILD_TIMESTAMP: &str = "1755639721739";
 
 // User-Agent string with CLI version
-const USER_AGENT: &str = concat!("nexus-cli/", "0.10.8");
+const USER_AGENT: &str = concat!("nexus-cli/", "0.10.9");
 
 // Privacy-preserving country detection for network optimization.
 // Only stores 2-letter country codes (e.g., "US", "CA", "GB") to help route
 // requests to the nearest Nexus network servers for better performance.
 // No precise location, IP addresses, or personal data is collected or stored.
 static COUNTRY_CODE: OnceLock<String> = OnceLock::new();
+pub(crate) type ProofPayload = (Vec<u8>, Vec<Vec<u8>>, Vec<String>);
+
 
 #[derive(Debug, Clone)]
 pub struct OrchestratorClient {
@@ -73,7 +75,43 @@ impl OrchestratorClient {
             endpoint.trim_start_matches('/')
         )
     }
-
+/// Selects which proof data to attach based on the `task_type`.
+    ///
+    /// Returns a tuple `(legacy_proof, proofs, individual_proof_hashes)` with the appropriate
+    /// fields populated:
+    /// - For `ProofHash`: no proof bytes and no hashes (server derives hash elsewhere).
+    /// - For `AllProofHashes`: no proof bytes; `individual_proof_hashes` populated.
+    /// - For other types (e.g. `ProofRequired`): `legacy_proof` is set only when exactly
+    ///   one proof is present (back-compat), and `proofs` contains the vector of full proofs.
+    pub(crate) fn select_proof_payload(
+        task_type: crate::nexus_orchestrator::TaskType,
+        legacy_proof: Vec<u8>,
+        proofs: Vec<Vec<u8>>,
+        individual_proof_hashes: &[String],
+    ) -> ProofPayload {
+        match task_type {
+            crate::nexus_orchestrator::TaskType::ProofHash => {
+                // For ProofHash tasks, don't send proof or individual hashes
+                (Vec::new(), Vec::new(), Vec::new())
+            }
+            crate::nexus_orchestrator::TaskType::AllProofHashes => {
+                // For AllProofHashes tasks, don't send proof but send all individual hashes
+                (Vec::new(), Vec::new(), individual_proof_hashes.to_vec())
+            }
+            _ => {
+                // For ProofRequired and backward compatibility:
+                // - Always include `proofs` as provided
+                // - Include `legacy_proof` only when there is exactly one proof, for servers/paths
+                //   that still expect a single legacy proof field
+                let legacy = if proofs.len() == 1 {
+                    legacy_proof
+                } else {
+                    Vec::new()
+                };
+                (legacy, proofs, Vec::new())
+            }
+        }
+    }
     fn encode_request<T: Message>(request: &T) -> Vec<u8> {
         request.encode_to_vec()
     }
@@ -350,6 +388,7 @@ impl Orchestrator for OrchestratorClient {
         task_id: &str,
         proof_hash: &str,
         proof: Vec<u8>,
+        proofs: Vec<Vec<u8>>,
         signing_key: SigningKey,
         num_provers: usize,
         task_type: crate::nexus_orchestrator::TaskType,
@@ -362,33 +401,20 @@ impl Orchestrator for OrchestratorClient {
         // Detect country for network optimization (privacy-preserving: only country code, no precise location)
         let location = "US".to_owned();
         // Handle different task types
-        let (proof_to_send, all_proof_hashes_to_send) = match task_type {
-            crate::nexus_orchestrator::TaskType::ProofHash => {
-                // For ProofHash tasks, don't send proof or individual hashes
-                (Vec::new(), Vec::new())
-            }
-            crate::nexus_orchestrator::TaskType::AllProofHashes => {
-                // For AllProofHashes tasks, don't send proof but send all individual hashes
-                // Add warning for large numbers of inputs
-                if individual_proof_hashes.len() > 100 {
-                    eprintln!(
-                        "WARNING: Task with {} individual proof hashes may not scale well for ALL_PROOF_HASHES task type",
-                        individual_proof_hashes.len()
-                    );
-                }
-                (Vec::new(), individual_proof_hashes.to_vec())
-            }
-            _ => {
-                // For ProofRequired and backward compatibility, attach proof
-                (proof, Vec::new())
-            }
-        };
+        let (proof_to_send, proofs_to_send, all_proof_hashes_to_send) =
+            OrchestratorClient::select_proof_payload(
+                task_type,
+                proof,
+                proofs,
+                individual_proof_hashes,
+            );
 
         let request = SubmitProofRequest {
             task_id: task_id.to_string(),
             node_type: NodeType::CliProver as i32,
             proof_hash: proof_hash.to_string(),
             proof: proof_to_send,
+            proofs: proofs_to_send,
             node_telemetry: Some(crate::nexus_orchestrator::NodeTelemetry {
                 flops_per_sec: Some(flops as i32),
                 memory_used: Some(program_memory),
@@ -399,7 +425,6 @@ impl Orchestrator for OrchestratorClient {
             ed25519_public_key: public_key,
             signature,
             all_proof_hashes: all_proof_hashes_to_send,
-            proofs: Vec::new(),
         };
         let request_bytes = Self::encode_request(&request);
         self.post_request_no_response("v3/tasks/submit", request_bytes)
