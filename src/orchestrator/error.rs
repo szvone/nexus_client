@@ -25,6 +25,14 @@ pub enum OrchestratorError {
     /// An error occurred while processing the request.
     #[error("HTTP error with status {status}: {message}")]
     Http { status: u16, message: String },
+
+    /// Request timed out
+    #[error("Request timeout after {seconds} seconds")]
+    Timeout { seconds: u64 },  // 新增超时错误变体
+
+    /// Maximum retries exceeded
+    #[error("Maximum retries ({retries}) exceeded")]
+    MaxRetriesExceeded { retries: usize },  // 新增重试次数超限错误
 }
 
 impl OrchestratorError {

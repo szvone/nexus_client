@@ -26,18 +26,6 @@ pub struct RegisterNodeResponse {
     #[prost(string, tag = "1")]
     pub node_id: ::prost::alloc::string::String,
 }
-
-/// Response to a node registration request.
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct SubmitProofResponse {
-    /// The node's ID.
-    #[prost(string, tag = "1")]
-    pub node_id: ::prost::alloc::string::String,
-    /// The type of this node.
-    #[prost(int32, tag = "2")]
-    pub node_point: i32,
-}
-
 /// A Prover task
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct Task {
@@ -45,10 +33,16 @@ pub struct Task {
     pub task_id: ::prost::alloc::string::String,
     #[prost(string, tag = "2")]
     pub program_id: ::prost::alloc::string::String,
+    #[deprecated]
     #[prost(bytes = "vec", tag = "3")]
     pub public_inputs: ::prost::alloc::vec::Vec<u8>,
     #[prost(message, optional, tag = "4")]
     pub created_at: ::core::option::Option<::prost_types::Timestamp>,
+    #[prost(bytes = "vec", repeated, tag = "5")]
+    pub public_inputs_list: ::prost::alloc::vec::Vec<::prost::alloc::vec::Vec<u8>>,
+    /// The type of task (proof required or only hash)
+    #[prost(enumeration = "TaskType", tag = "6")]
+    pub task_type: i32,
 }
 /// Get outstanding tasks for a node.
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -78,19 +72,30 @@ pub struct GetProofTaskRequest {
     /// The client's Ed25519 public key for proof authentication.Add commentMore actions
     #[prost(bytes = "vec", tag = "3")]
     pub ed25519_public_key: ::prost::alloc::vec::Vec<u8>,
+    /// The maximum difficulty level the client wants to handle
+    #[prost(enumeration = "TaskDifficulty", tag = "4")]
+    pub max_difficulty: i32,
 }
 /// A Prover task.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct GetProofTaskResponse {
+    /// Deprecated: use field in Task instead.
     /// Program id. (Assuming client-side default programs)
+    #[deprecated]
     #[prost(string, tag = "1")]
     pub program_id: ::prost::alloc::string::String,
+    /// Deprecated: use field in Task instead.
     /// Public inputs to the program.
+    #[deprecated]
     #[prost(bytes = "vec", tag = "2")]
     pub public_inputs: ::prost::alloc::vec::Vec<u8>,
+    /// Deprecated: use field in Task instead.
     /// The task's ID.
+    #[deprecated]
     #[prost(string, tag = "3")]
     pub task_id: ::prost::alloc::string::String,
+    #[prost(message, optional, tag = "4")]
+    pub task: ::core::option::Option<Task>,
 }
 /// Submit the result of a prover task.
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -98,13 +103,13 @@ pub struct SubmitProofRequest {
     /// The type of this node.
     #[prost(enumeration = "NodeType", tag = "2")]
     pub node_type: i32,
-    /// Hash of the proof.
+    /// Hash of the concatenated proof bytes.
     #[prost(string, tag = "3")]
     pub proof_hash: ::prost::alloc::string::String,
     /// Telemetry data about the node
     #[prost(message, optional, tag = "4")]
     pub node_telemetry: ::core::option::Option<NodeTelemetry>,
-    /// ZK proof of the proof activity
+    /// ZK proof of the program and first set of inputs.
     #[prost(bytes = "vec", tag = "5")]
     pub proof: ::prost::alloc::vec::Vec<u8>,
     /// The task's ID.
@@ -120,6 +125,14 @@ pub struct SubmitProofRequest {
     /// corresponding to the public key.
     #[prost(bytes = "vec", tag = "8")]
     pub signature: ::prost::alloc::vec::Vec<u8>,
+    /// Hash of each individual proof.
+    /// Sent only on ALL_PROOF_HASHES task type.
+    #[prost(string, repeated, tag = "9")]
+    pub all_proof_hashes: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    /// ZK proofs of the program running on each set of inputs.
+    /// To be sent on PROOF_REQUIRED tasks, empty on other task types.
+    #[prost(bytes = "vec", repeated, tag = "10")]
+    pub proofs: ::prost::alloc::vec::Vec<::prost::alloc::vec::Vec<u8>>,
 }
 /// Performance stats of a node.
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -146,6 +159,13 @@ pub struct Node {
     /// The type of node
     #[prost(enumeration = "NodeType", tag = "2")]
     pub node_type: i32,
+}
+/// Response to get a single node by ID
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct GetNodeResponse {
+    /// The wallet address of the node's owner
+    #[prost(string, tag = "1")]
+    pub wallet_address: ::prost::alloc::string::String,
 }
 /// Response returning all nodes associated with a user
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -187,6 +207,72 @@ impl NodeType {
         match value {
             "WEB_PROVER" => Some(Self::WebProver),
             "CLI_PROVER" => Some(Self::CliProver),
+            _ => None,
+        }
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum TaskDifficulty {
+    /// Small difficulty bucket
+    Small = 0,
+    /// Medium difficulty bucket
+    Medium = 5,
+    /// Large difficulty bucket
+    Large = 10,
+}
+impl TaskDifficulty {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Small => "SMALL",
+            Self::Medium => "MEDIUM",
+            Self::Large => "LARGE",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "SMALL" => Some(Self::Small),
+            "MEDIUM" => Some(Self::Medium),
+            "LARGE" => Some(Self::Large),
+            _ => None,
+        }
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum TaskType {
+    /// Task requires a proof to be submitted
+    ProofRequired = 0,
+    /// Task does not require a proof to be submitted.
+    /// All proof hashes should be hashed together.
+    ProofHash = 1,
+    /// Task does not require a proof to be submitted,
+    /// but alll proof hashes should be sent.
+    AllProofHashes = 2,
+}
+impl TaskType {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::ProofRequired => "PROOF_REQUIRED",
+            Self::ProofHash => "PROOF_HASH",
+            Self::AllProofHashes => "ALL_PROOF_HASHES",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "PROOF_REQUIRED" => Some(Self::ProofRequired),
+            "PROOF_HASH" => Some(Self::ProofHash),
+            "ALL_PROOF_HASHES" => Some(Self::AllProofHashes),
             _ => None,
         }
     }

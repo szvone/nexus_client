@@ -4,9 +4,8 @@
 
 use crate::environment::Environment;
 use crate::nexus_orchestrator::{
-    GetProofTaskRequest, GetProofTaskResponse, GetTasksResponse, NodeType, RegisterNodeRequest,
-    RegisterNodeResponse, RegisterUserRequest, SubmitProofRequest, SubmitProofResponse,
-    UserResponse,
+    GetProofTaskRequest, GetProofTaskResponse, NodeType, RegisterNodeRequest, RegisterNodeResponse,
+    RegisterUserRequest, SubmitProofRequest, TaskDifficulty, UserResponse,
 };
 use crate::orchestrator::Orchestrator;
 use crate::orchestrator::error::OrchestratorError;
@@ -14,9 +13,16 @@ use crate::system::{estimate_peak_gflops, get_memory_info};
 use crate::task::Task;
 use ed25519_dalek::{Signer, SigningKey, VerifyingKey};
 use prost::Message;
+use reqwest::{Proxy, StatusCode};
 use reqwest::{Client, ClientBuilder, Response};
 use std::sync::OnceLock;
-use std::time::Duration;
+use tokio::time::{Duration, timeout};
+
+// Build timestamp in milliseconds since epoch
+static BUILD_TIMESTAMP: &str = "1755272024349";
+
+// User-Agent string with CLI version
+const USER_AGENT: &str = concat!("nexus-cli/", "0.10.8");
 
 // Privacy-preserving country detection for network optimization.
 // Only stores 2-letter country codes (e.g., "US", "CA", "GB") to help route
@@ -32,13 +38,32 @@ pub struct OrchestratorClient {
 
 impl OrchestratorClient {
     pub fn new(environment: Environment) -> Self {
-        Self {
-            client: ClientBuilder::new()
-                .timeout(Duration::from_secs(10))
-                .build()
-                .expect("Failed to create HTTP client"),
-            environment,
-        }
+        // Self {
+        //     client: ClientBuilder::new()
+        //         .connect_timeout(Duration::from_secs(10))
+        //         .timeout(Duration::from_secs(10))
+        //         .build()
+        //         .expect("Failed to create HTTP client"),
+        //     environment,
+        // }
+        // 固定代理地址（根据需要修改实际代理配置）
+    // const PROXY_ADDR: &str = "http://127.0.0.1:2025";
+    
+    // 创建带代理的客户端
+    let client = ClientBuilder::new()
+        //  .proxy(Proxy::all(PROXY_ADDR).expect("无效的代理配置")) // 固定代理设置
+        .connect_timeout(Duration::from_secs(10))
+        .danger_accept_invalid_certs(true)  // 忽略所有证书错误
+
+        .timeout(Duration::from_secs(10))
+        .build()
+        .expect("Failed to create HTTP client");
+
+    Self {
+        client,
+        environment,
+    }
+
     }
 
     fn build_url(&self, endpoint: &str) -> String {
@@ -69,7 +94,13 @@ impl OrchestratorClient {
         endpoint: &str,
     ) -> Result<T, OrchestratorError> {
         let url = self.build_url(endpoint);
-        let response = self.client.get(&url).send().await?;
+        let response = self
+            .client
+            .get(&url)
+            .header("User-Agent", USER_AGENT)
+            .header("X-Build-Timestamp", "1755045583717")
+            .send()
+            .await?;
 
         let response = Self::handle_response_status(response).await?;
         let response_bytes = response.bytes().await?;
@@ -82,65 +113,83 @@ impl OrchestratorClient {
         body: Vec<u8>,
     ) -> Result<T, OrchestratorError> {
         let url = self.build_url(endpoint);
-        let mut attempt = 0;
-        const MAX_ATTEMPTS: usize = 3; // 初始请求 + 1次重试
+        let response = self
+            .client
+            .post(&url)
+            .header("Content-Type", "application/octet-stream")
+            .header("User-Agent", USER_AGENT)
+            .header("X-Build-Timestamp", BUILD_TIMESTAMP)
+            .body(body)
+            .send()
+            .await?;
 
-        loop {
-            attempt += 1;
-
-            // 构建请求
-            let request = self
-                .client
-                .post(&url)
-                .header("Content-Type", "application/octet-stream")
-                .body(body.clone()); // 克隆 body 用于可能的多次尝试
-
-            // 发送请求并处理响应
-            match request.send().await {
-                Ok(response) => {
-                    let response = Self::handle_response_status(response).await?;
-                    let response_bytes = response.bytes().await?;
-                    return Self::decode_response(&response_bytes);
-                }
-                Err(e) => {
-                    // 判断是否为超时错误
-                    let is_timeout = e.is_timeout();
-
-                    // log::warn!(
-                    //     "请求失败 (尝试 {}/{}): {} - URL: {}",
-                    //     attempt,
-                    //     MAX_ATTEMPTS,
-                    //     e,
-                    //     url
-                    // );
-
-                    // 如果不是超时错误或者已达最大尝试次数，直接返回错误
-                    if !is_timeout || attempt >= MAX_ATTEMPTS {
-                        return Err(OrchestratorError::Reqwest(e));
-                    }
-                }
-            }
-        }
+        let response = Self::handle_response_status(response).await?;
+        let response_bytes = response.bytes().await?;
+        Self::decode_response(&response_bytes)
     }
-
     async fn post_request_no_response(
         &self,
         endpoint: &str,
         body: Vec<u8>,
     ) -> Result<(), OrchestratorError> {
+        const MAX_RETRIES: usize = 2;
+        const TIMEOUT_SECONDS: u64 = 30;
         let url = self.build_url(endpoint);
-        let response = self
-            .client
-            .post(&url)
-            .header("Content-Type", "application/octet-stream")
-            .body(body)
-            .send()
-            .await?;
 
-        Self::handle_response_status(response).await?;
-        Ok(())
+        for attempt in 0..MAX_RETRIES {
+            match timeout(
+                Duration::from_secs(TIMEOUT_SECONDS),
+                self.send_request(&url, body.clone()),
+            )
+            .await
+            {
+                Ok(Ok(())) => return Ok(()),
+                Ok(Err(e)) => {
+                    if let OrchestratorError::Http { status, .. } = &e {
+                        if (500..600).contains(status) {
+                            continue;
+                        }
+                    }
+                    return Err(e);
+                }
+                Err(_) => {
+                    if attempt == MAX_RETRIES - 1 {
+                        return Err(OrchestratorError::MaxRetriesExceeded {
+                            retries: MAX_RETRIES,
+                        });
+                    }
+                    continue;
+                }
+            }
+        }
+
+        Err(OrchestratorError::Timeout {
+            seconds: TIMEOUT_SECONDS,
+        })
     }
 
+    async fn send_request(&self, url: &str, body: Vec<u8>) -> Result<(), OrchestratorError> {
+        let response = self
+            .client
+            .post(url)
+            .header("Content-Type", "application/octet-stream")
+            .header("User-Agent", USER_AGENT)
+            .header("X-Build-Timestamp", BUILD_TIMESTAMP)
+            .timeout(Duration::from_secs(15))
+            
+            .body(body)
+            .send()
+            .await
+            .map_err(|e| OrchestratorError::Reqwest(e))?;
+
+        if response.status().is_success() {
+            Ok(())
+        } else {
+            let status = response.status().as_u16();
+            let message = response.text().await.unwrap_or_default();
+            Err(OrchestratorError::Http { status, message })
+        }
+    }
     fn create_signature(
         &self,
         signing_key: &SigningKey,
@@ -242,7 +291,6 @@ impl Orchestrator for OrchestratorClient {
     async fn get_user(&self, wallet_address: &str) -> Result<String, OrchestratorError> {
         let wallet_path = urlencoding::encode(wallet_address).into_owned();
         let endpoint = format!("v3/users/{}", wallet_path);
-
         let user_response: UserResponse = self.get_request(&endpoint).await?;
         Ok(user_response.user_id)
     }
@@ -258,7 +306,6 @@ impl Orchestrator for OrchestratorClient {
             wallet_address: wallet_address.to_string(),
         };
         let request_bytes = Self::encode_request(&request);
-
         self.post_request_no_response("v3/users", request_bytes)
             .await
     }
@@ -270,15 +317,16 @@ impl Orchestrator for OrchestratorClient {
             user_id: user_id.to_string(),
         };
         let request_bytes = Self::encode_request(&request);
-
         let response: RegisterNodeResponse = self.post_request("v3/nodes", request_bytes).await?;
         Ok(response.node_id)
     }
 
-    async fn get_tasks(&self, node_id: &str) -> Result<Vec<Task>, OrchestratorError> {
-        let response: GetTasksResponse = self.get_request(&format!("v3/tasks/{}", node_id)).await?;
-        let tasks = response.tasks.iter().map(Task::from).collect();
-        Ok(tasks)
+    /// Get the wallet address associated with a node ID.
+    async fn get_node(&self, node_id: &str) -> Result<String, OrchestratorError> {
+        let endpoint = format!("v3/nodes/{}", node_id);
+        let node_response: crate::nexus_orchestrator::GetNodeResponse =
+            self.get_request(&endpoint).await?;
+        Ok(node_response.wallet_address)
     }
 
     async fn get_proof_task(
@@ -290,9 +338,9 @@ impl Orchestrator for OrchestratorClient {
             node_id: node_id.to_string(),
             node_type: NodeType::CliProver as i32,
             ed25519_public_key: verifying_key.to_bytes().to_vec(),
+            max_difficulty: TaskDifficulty::Large as i32,
         };
         let request_bytes = Self::encode_request(&request);
-
         let response: GetProofTaskResponse = self.post_request("v3/tasks", request_bytes).await?;
         Ok(Task::from(&response))
     }
@@ -304,21 +352,45 @@ impl Orchestrator for OrchestratorClient {
         proof: Vec<u8>,
         signing_key: SigningKey,
         num_provers: usize,
-    ) -> Result<i32, OrchestratorError> {
+        task_type: crate::nexus_orchestrator::TaskType,
+        individual_proof_hashes: &[String],
+    ) -> Result<(), OrchestratorError> {
         let (program_memory, total_memory) = get_memory_info();
         let flops = estimate_peak_gflops(num_provers);
         let (signature, public_key) = self.create_signature(&signing_key, task_id, proof_hash);
 
         // Detect country for network optimization (privacy-preserving: only country code, no precise location)
-        // let location = self.get_country().await;
         let location = "US".to_owned();
+        // Handle different task types
+        let (proof_to_send, all_proof_hashes_to_send) = match task_type {
+            crate::nexus_orchestrator::TaskType::ProofHash => {
+                // For ProofHash tasks, don't send proof or individual hashes
+                (Vec::new(), Vec::new())
+            }
+            crate::nexus_orchestrator::TaskType::AllProofHashes => {
+                // For AllProofHashes tasks, don't send proof but send all individual hashes
+                // Add warning for large numbers of inputs
+                if individual_proof_hashes.len() > 100 {
+                    eprintln!(
+                        "WARNING: Task with {} individual proof hashes may not scale well for ALL_PROOF_HASHES task type",
+                        individual_proof_hashes.len()
+                    );
+                }
+                (Vec::new(), individual_proof_hashes.to_vec())
+            }
+            _ => {
+                // For ProofRequired and backward compatibility, attach proof
+                (proof, Vec::new())
+            }
+        };
+
         let request = SubmitProofRequest {
             task_id: task_id.to_string(),
             node_type: NodeType::CliProver as i32,
             proof_hash: proof_hash.to_string(),
-            proof,
+            proof: proof_to_send,
             node_telemetry: Some(crate::nexus_orchestrator::NodeTelemetry {
-                flops_per_sec: Some(1),
+                flops_per_sec: Some(flops as i32),
                 memory_used: Some(program_memory),
                 memory_capacity: Some(total_memory),
                 // Country code for network routing optimization (privacy-preserving)
@@ -326,11 +398,11 @@ impl Orchestrator for OrchestratorClient {
             }),
             ed25519_public_key: public_key,
             signature,
+            all_proof_hashes: all_proof_hashes_to_send,
+            proofs: Vec::new(),
         };
         let request_bytes = Self::encode_request(&request);
-        let response: SubmitProofResponse =
-            self.post_request("v3/tasks/submit", request_bytes).await?;
-
-        Ok(response.node_point)
+        self.post_request_no_response("v3/tasks/submit", request_bytes)
+            .await
     }
 }

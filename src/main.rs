@@ -4,20 +4,23 @@ mod orchestrator;
 mod prover;
 pub mod system;
 mod task;
-
+mod verifier;
 use crate::environment::Environment;
+use crate::nexus_orchestrator::TaskType;
 use crate::orchestrator::error::OrchestratorError;
 use crate::orchestrator::{Orchestrator, OrchestratorClient};
-use crate::prover::ProveResult;
+use crate::prover::ProverResult;
 use ed25519_dalek::SigningKey;
 use mac_address::get_mac_address;
+use rand::Rng;
 use reqwest::{Client, Error as ReqwestError, blocking::Client as blockingClient};
 use serde::{Deserialize, Serialize};
+use sha3::{Digest, Keccak256};
 use std::thread;
+use std::time::{Duration, Instant};
 use systemstat::{Platform, System};
-use uuid::Uuid;
-use std::time::{Instant, Duration};
 use tokio::time::sleep;
+use uuid::Uuid;
 
 use mimalloc::MiMalloc;
 #[global_allocator]
@@ -30,7 +33,9 @@ struct TaskRequest {
     #[serde(rename = "programId")]
     program_id: String,
     #[serde(rename = "publicInputs")]
-    public_inputs: String,
+    public_inputs_list: String,
+    #[serde(rename = "taskType")]
+    task_type: i32,
     #[serde(rename = "signKey")]
     sign_key: String,
 }
@@ -110,23 +115,38 @@ async fn main() {
     log::info!("客户端启动: 初始化完成，计算节点启动！");
 
     let http_client = Client::new();
-
+    let mut noTask = false;
     loop {
-        log::info!("-------------------------------------------");
+        let start_time = Instant::now();
 
         match fetch_task(&http_client, pick_url.clone()).await {
             Ok(Some(payload)) => {
+                noTask = false;
+
+                log::info!("-------------------------------------------");
+
                 log::info!("获取计算任务: {}", payload.task_id);
-                let start_time = Instant::now();
 
                 let task = prover::Task::from(payload.clone());
-                let result = prover::prove_task(task);
+                // let result: Result<ProverResult, anyhow::Error> = prover::prove_task(task);
+                let result: Result<ProverResult, anyhow::Error> =
+                    prover::prove_task2(task, Some(3));
 
                 let response = match result {
                     Ok(proof) => {
                         let elapsed_ms = start_time.elapsed().as_millis();
-                        log::info!("任务计算成功: 计算耗时 {} 毫秒 ", elapsed_ms);
-                        handle_proof(&payload, &proof).await
+                        log::info!("任务计算成功: 计算耗时 {} 秒 ", elapsed_ms / 1000);
+                        log::info!("提交计算结果: 提交中...");
+                        // handle_proof(&payload, &proof).await
+
+                        let response = handle_proof(&payload, &proof).await;
+
+                        // 显式释放大内存对象：这里我们无法控制MiMalloc内部，但显式drop可以帮助内存更早被回收
+                        drop(proof.proof); // 如果`proof.proof`是大对象，直接drop它
+
+                        // 注意：整个proof结构体在作用域结束后也会被drop，这里提前释放了部分成员。
+                        // log::debug!("已释放证明内存");
+                        response
                     }
                     Err(err) => {
                         let error = format!("Proof generation failed: {}", err);
@@ -148,21 +168,29 @@ async fn main() {
                 {
                     log::info!("回传任务结果: 失败-> {:?}", e);
                 } else {
+                    let elapsed_ms = start_time.elapsed().as_millis();
                     log::info!("回传任务结果: 回传数据成功！");
+                    log::info!("任务计算完成: 耗时 {} 秒 ", elapsed_ms / 1000);
                 }
+                log::info!("-------------------------------------------");
             }
             Ok(None) => {
-                log::info!("获取计算任务: 没有计算任务，等待5秒！");
+                if !noTask {
+                    noTask = true;
+                    log::warn!("-------------------------------------------");
+                    log::warn!("获取计算任务: 没有计算任务，客户端空闲中！");
+                    log::warn!("-------------------------------------------");
+                }
                 sleep(Duration::from_secs(5)).await;
             }
             Err(e) => {
-                
-                log::info!("获取计算任务: 失败，请检查IP端口是否正确，服务端是否运行!");
+                log::error!("-------------------------------------------");
+                log::error!("获取计算任务: 失败，请检查IP端口是否正确，服务端是否运行!");
+                log::error!("-------------------------------------------");
 
                 sleep(Duration::from_secs(10)).await;
             }
         }
-        log::info!("-------------------------------------------");
     }
 }
 
@@ -180,8 +208,18 @@ async fn fetch_task(client: &Client, url: String) -> Result<Option<TaskRequest>,
     let response: reqwest::Response = client.get(url).send().await?;
 
     if response.status().is_success() {
-        let payload: TaskRequest = response.json().await?;
-        Ok(Some(payload))
+        // 先读取原始响应文本
+        let raw_response = response.text().await?;
+        // 尝试解析JSON
+        match serde_json::from_str::<TaskRequest>(&raw_response) {
+            Ok(payload) => Ok(Some(payload)),
+            Err(e) => {
+                log::error!("Failed to parse JSON: {}", e);
+                log::error!("Error occurred at line {}, column {}", e.line(), e.column());
+                log::error!("Raw response that failed to parse: {}", raw_response);
+                Ok(None)
+            }
+        }
     } else if response.status().as_u16() == 404 {
         Ok(None)
     } else {
@@ -189,7 +227,7 @@ async fn fetch_task(client: &Client, url: String) -> Result<Option<TaskRequest>,
     }
 }
 
-async fn handle_proof(task: &TaskRequest, proof: &ProveResult) -> Api2Response {
+async fn handle_proof(task: &TaskRequest, proof: &ProverResult) -> Api2Response {
     // Convert sign key
     let bytes = match hex::decode(&task.sign_key) {
         Ok(bytes) => bytes,
@@ -223,24 +261,42 @@ async fn handle_proof(task: &TaskRequest, proof: &ProveResult) -> Api2Response {
             };
         }
     };
+    // let proof_bytes = postcard::to_allocvec(&proof.proof).unwrap();
+    let proof_bytes = match &proof.proof {
+        Some(data) => postcard::to_allocvec(data).unwrap(),
+        None => {
+            // 生成32字节随机数
+            let mut rng = rand::thread_rng();
+            let mut random_bytes = [0u8; 32];
+            rng.fill(&mut random_bytes);
+            random_bytes.to_vec()
+        }
+    };
 
+    
+    let task_type = TaskType::try_from(task.task_type).unwrap_or_else(|_| {
+        log::warn!("Invalid TaskType, defaulting to ProofRequired");
+        TaskType::ProofHash
+    });
     let client = OrchestratorClient::new(Environment::Beta);
     match client
         .submit_proof(
             &task.task_id,
-            &proof.proof_hash,
-            proof.proof_bytes.clone(),
+            &proof.combined_hash.clone(),
+            proof_bytes.clone(),
             signing_key.clone(),
             5,
+            task_type,
+            &proof.proof_hashes.clone(),
         )
         .await
     {
-        Ok(node_point) => {
+        Ok(()) => {
             log::info!("任务提交结果: 提交成功");
 
             return Api2Response {
                 task_id: task.task_id.clone(),
-                credits: node_point,
+                credits: 0,
                 result: "success".to_owned(),
             };
         }
@@ -278,19 +334,21 @@ async fn handle_proof(task: &TaskRequest, proof: &ProveResult) -> Api2Response {
             match client
                 .submit_proof(
                     &task.task_id,
-                    &proof.proof_hash,
-                    proof.proof_bytes.clone(),
+                    &proof.combined_hash.clone(),
+                    proof_bytes.clone(),
                     signing_key.clone(),
                     5,
+                    task_type,
+                    &proof.proof_hashes.clone(),
                 )
                 .await
             {
-                Ok(node_point) => {
+                Ok(()) => {
                     log::info!("任务提交结果: 提交成功");
 
                     return Api2Response {
                         task_id: task.task_id.clone(),
-                        credits: node_point,
+                        credits: 0,
                         result: "success".to_owned(),
                     };
                 }
@@ -363,7 +421,7 @@ fn heartbeat_loop(api: String, client_uuid: String, client_key: String) {
 
         // 发送心跳请求
         if let Err(e) = send_heartbeat(api.clone(), &http_client, &data) {
-            log::info!("心跳请求与服务端通讯失败，请检查IP端口！");
+            log::error!("心跳请求与服务端通讯失败，请检查IP端口！");
             // eprintln!("Error sending heartbeat: {}", e);
         }
 

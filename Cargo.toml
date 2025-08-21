@@ -31,10 +31,13 @@ anyhow = "1.0"
 mimalloc = "0.1"
 log = "0.4"
 env_logger = "0.10" # 可选，用于日志记录
+chrono = "0.4"      # 用于本地时间处理
 serde_yaml = "0.9"
 mac_address = "1.1.5"
 uuid = { version = "1.0", features = ["v4"] }
 systemstat = "0.2.0"
+rayon = "1.9"
+num_cpus = "1.14"  # 用于获取逻辑核心数
 
 
 [dev-dependencies]
