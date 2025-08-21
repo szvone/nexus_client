@@ -13,3 +13,5 @@
 4、参照使用说明完成配置nexus_client.txt，即可使用
 
 5、win系统直接双击exe文件，Mac和Linux在终端使用命令 ./nexus_client 启动。
+
+如有帮助，欢迎打赏，打赏地址：0x56affcaaa4703a9e650df7588ff8a10a08cc7b55
